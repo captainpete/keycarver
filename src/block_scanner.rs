@@ -3,7 +3,10 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::collections::HashSet;
-use rayon::prelude::*;
+use indicatif::ProgressBar;
+use std::time::Instant;
+use indicatif::ParallelProgressIterator;
+use rayon::iter::{ParallelIterator, IntoParallelRefIterator};
 
 /// Extract Bitcoin addresses from transaction outputs (TxOut).
 fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<Address> {
@@ -69,7 +72,8 @@ fn extract_addresses_from_block_file(path: String) -> Result<HashSet<Address>, B
 pub fn extract_addresses_from_folder(
     folder_path: &str,
 ) -> Result<HashSet<Address>, Box<dyn std::error::Error>> {
-    print!("Reading addresses from {}... ", folder_path);
+    let pb = ProgressBar::new_spinner();
+    let start = Instant::now();
 
     // Get all files in the folder
     let paths = fs::read_dir(folder_path)?
@@ -86,8 +90,10 @@ pub fn extract_addresses_from_folder(
         .collect::<Vec<String>>();
 
     // Process files in parallel
+    pb.set_message("Scanning block files");
     let global_addresses: HashSet<Address> = paths
-        .par_iter() // Convert the list of paths into a parallel iterator
+        .par_iter()
+        .progress_count(paths.len() as u64)
         .map(|path| {
             // Process each file and extract addresses
             extract_addresses_from_block_file(path.clone()).unwrap_or_else(|_| HashSet::new())
@@ -96,7 +102,8 @@ pub fn extract_addresses_from_folder(
             acc.extend(addresses);
             acc
         });
+    let duration = start.elapsed();
+    pb.finish_with_message(format!("Scanned {} files in {:.2?}", paths.len(), duration));
 
-    println!("done, read {} addresses", global_addresses.len());
     Ok(global_addresses)
 }
