@@ -4,8 +4,9 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::collections::HashSet;
 use indicatif::ProgressBar;
-use std::thread;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
+use crossbeam::channel::bounded;
+use crossbeam::scope;
 
 /// Extract Bitcoin addresses from transaction outputs (TxOut).
 fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<Address> {
@@ -87,45 +88,40 @@ pub fn extract_addresses_from_folder(
 
     let pb = ProgressBar::new(paths.len() as u64);
     let file_queue = Arc::new(Mutex::new(paths));
-    let (tx, rx) = mpsc::channel::<HashSet<Address>>();
+    // let (tx, rx) = mpsc::channel::<HashSet<Address>>();
+    let (tx, rx) = bounded::<HashSet<Address>>(10);
 
     // Spawn worker threads
-    let mut workers = Vec::new();
     let num_workers = std::thread::available_parallelism()?;
-    for _ in 0..num_workers.into() {
-        let file_queue = Arc::clone(&file_queue);
-        let tx = tx.clone();
-        workers.push(thread::spawn(move || {
-            while let Some(path) = {
-                let mut queue = file_queue.lock().unwrap();
-                queue.pop()
-            } {
-                match extract_addresses_from_block_file(path) {
-                    Ok(addresses) => {
-                        tx.send(addresses).unwrap();
-                    }
-                    Err(err) => {
-                        eprintln!("Error processing file: {}", err);
+    scope(|s| {
+        for _ in 0..num_workers.into() {
+            let file_queue = Arc::clone(&file_queue);
+            let tx = tx.clone();
+            s.spawn(move |_| {
+                while let Some(path) = {
+                    let mut queue = file_queue.lock().unwrap();
+                    queue.pop()
+                } {
+                    match extract_addresses_from_block_file(path) {
+                        Ok(addresses) => {
+                            tx.send(addresses).unwrap();
+                        }
+                        Err(err) => {
+                            eprintln!("Error processing file: {}", err);
+                        }
                     }
                 }
-            }
-        }));
-    }
+            });
+        }
 
-    // Drop the sender so that the receiver can finish
-    drop(tx);
+        drop(tx);
 
-    // Reducer thread
-    let mut addresses = HashSet::new();
-    for batch in rx {
-        addresses.extend(batch);
-        pb.inc(1);
-    }
+        let mut addresses = HashSet::new();
+        for batch in rx {
+            addresses.extend(batch);
+            pb.inc(1);
+        }
 
-    // Wait for all workers to finish
-    for worker in workers {
-        worker.join().unwrap();
-    }
-
-    Ok(addresses)
+        Ok(addresses)
+    }).unwrap()
 }
