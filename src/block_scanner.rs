@@ -43,6 +43,9 @@ fn extract_addresses_from_block_file(path: String) -> Result<HashSet<Address>, B
         if reader.read_exact(&mut magic).is_err() {
             break; // End of file
         }
+        if magic == [0, 0, 0, 0] {
+            break; // Padding or EOF marker
+        }
 
         // Verify magic number
         if magic != MAINNET_MAGIC {
