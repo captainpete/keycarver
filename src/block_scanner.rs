@@ -1,8 +1,9 @@
+use std::path::Path;
 use bitcoin::hashes::Hash;
 use bitcoin::{consensus::deserialize, Address, Block, Network, TxOut};
 use indicatif::{ParallelProgressIterator, ProgressBar};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use sled;
+use rocksdb::{Options, DB, WriteBatch};
 use std::collections::HashSet;
 use std::fs::{File, read_dir};
 use std::io::{BufReader, Read};
@@ -90,9 +91,14 @@ fn extract_addresses_from_block_file(path: String) -> Result<HashSet<AddressHash
 /// Process all `blk*.dat` files in a folder
 pub fn load_unique_addresses_into_database(
     block_dir: &str,
-    db: &sled::Db,
+    db_path: &Path,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Open RocksDB with default options
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    let db = DB::open(&opts, db_path)?;
+
     // Get all files in the folder
     let paths = read_dir(block_dir)?
         .filter_map(|entry| entry.ok()) // Ignore errors
@@ -108,14 +114,17 @@ pub fn load_unique_addresses_into_database(
         .collect::<Vec<String>>();
 
     pb.set_length(paths.len() as u64);
+
+    // Process files in parallel
     paths.par_iter().progress_with(pb.clone()).for_each(|path| {
         match extract_addresses_from_block_file(path.to_string()) {
             Ok(addresses) => {
-                let mut batch = sled::Batch::default();
+                let mut batch = WriteBatch::default();
                 for address in addresses {
-                    batch.insert(Sha256::digest(&address).to_vec(), &address);
+                    let hash = Sha256::digest(&address);
+                    batch.put(hash.as_slice(), &address);
                 }
-                db.apply_batch(batch).unwrap();
+                db.write(batch).unwrap();
             }
             Err(err) => {
                 eprintln!("Error processing file: {}", err);

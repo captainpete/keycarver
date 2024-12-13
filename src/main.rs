@@ -2,7 +2,6 @@ mod address_index;
 mod block_scanner;
 use clap::{Parser, Subcommand};
 use std::time::Instant;
-use sled;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 #[derive(Parser)]
@@ -47,14 +46,13 @@ fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
         .unwrap();
 
     // Step 1: Create a sled database, populate with unique addresses
-    let sled_dir = index_dir.join("sled");
-    std::fs::create_dir_all(&sled_dir)?;
-    let db = sled::open(&sled_dir)?;
+    let db_dir = index_dir.join("rocksdb");
+    std::fs::create_dir_all(&db_dir)?;
 
     let step1_pb = multi_progress.add(ProgressBar::new(0).with_style(bar_style.clone()));
     step1_pb.set_message("Step 1: Scanning block files and populating database");
     let start = Instant::now();
-    block_scanner::load_unique_addresses_into_database(block_dir, &db, &step1_pb)?;
+    block_scanner::load_unique_addresses_into_database(block_dir, &db_dir, &step1_pb)?;
     step1_pb.finish_with_message(format!("Step 1: Done in {:.2?}", start.elapsed()));
 
     // Step 2: Create staging files
@@ -64,7 +62,7 @@ fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
     let step2_pb = multi_progress.add(ProgressBar::new(0).with_style(bar_style.clone()));
     step2_pb.set_message("Step 2: Creating staging files");
     let start = Instant::now();
-    address_index::create_staging_files(&db, &staging_dir, 16usize, &step2_pb)?;
+    address_index::create_staging_files(&db_dir, &staging_dir, 16usize, &step2_pb)?;
     step2_pb.finish_with_message(format!("Step 2: Done in {:.2?}", start.elapsed()));
 
     // Step 3: Create MPHF
@@ -85,7 +83,7 @@ fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
 
     // Step 5: Clean up temporary directories
     std::fs::remove_dir_all(staging_dir)?;
-    std::fs::remove_dir_all(sled_dir)?;
+    std::fs::remove_dir_all(db_dir)?;
 
     Ok(())
 }

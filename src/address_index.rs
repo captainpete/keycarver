@@ -5,7 +5,7 @@ use hex;
 use indicatif::{ParallelProgressIterator, ProgressBar};
 use memmap2::{MmapMut, Mmap};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use sled;
+use rocksdb::{Options, DB};
 use std::convert::TryInto;
 use std::error::Error;
 use std::fs;
@@ -55,18 +55,27 @@ fn compute_sha256_partitions(n_partitions: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-/// Create staging files for each partition of the SHA256 key space.
-pub fn create_staging_files(db: &sled::Db, staging_dir: &Path, n_partitions: usize, pb: &ProgressBar) -> Result<(), Box<dyn Error>>{
+/// Create staging files for each partition of the SHA256 key space using RocksDB.
+pub fn create_staging_files(db_path: &Path, staging_dir: &Path, n_partitions: usize, pb: &ProgressBar) -> Result<(), Box<dyn Error>> {
     let partition_ranges = compute_sha256_partitions(n_partitions);
     pb.set_length(partition_ranges.len() as u64);
+
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    let db = DB::open(&opts, db_path)?;
+
     partition_ranges.into_par_iter().progress_with(pb.clone()).for_each(|(start, end)| {
         let staging_file_path = staging_dir.join(format!("staging_{}_{}.db", hex::encode(&start), hex::encode(&end)));
         let staging_file = File::create(&staging_file_path).unwrap();
         let mut writer = BufWriter::new(staging_file);
-        for result in db.range(start..end) {
-            let (_, value) = result.unwrap();
-            let address = value.to_vec();
-            writer.write_all(&address).unwrap();
+
+        let iterator = db.iterator(rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward));
+        for result in iterator {
+            let (key, value) = result.unwrap();
+            if key.as_ref() >= end.as_slice() {
+                break;
+            }
+            writer.write_all(&value).unwrap();
         }
         writer.flush().unwrap();
     });
