@@ -62,9 +62,9 @@ fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
     let step2_pb = multi_progress.add(ProgressBar::new(0).with_style(bar_style.clone()));
     step2_pb.set_message("Step 2: Creating staging files");
     let start = Instant::now();
-    address_index::create_staging_files(&db_dir, &staging_dir, 16usize, &step2_pb)?;
+    address_index::create_staging_files(&db_dir, &staging_dir, 64usize, &step2_pb)?;
     step2_pb.finish_with_message(format!("Step 2: Done in {:.2?}", start.elapsed()));
-
+    
     // Step 3: Create MPHF
     let step3_pb = multi_progress.add(ProgressBar::new_spinner().with_style(spinner_style.clone()));
     step3_pb.enable_steady_tick(std::time::Duration::from_millis(100));
