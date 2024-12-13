@@ -1,20 +1,36 @@
-use bitcoin::{consensus::deserialize, Block, TxOut, Network, Address};
-use std::fs;
-use std::fs::File;
-use std::io::{BufReader, Read};
+use bitcoin::hashes::Hash;
+use bitcoin::{consensus::deserialize, Address, Block, Network, TxOut};
+use indicatif::{ParallelProgressIterator, ProgressBar};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use sled;
 use std::collections::HashSet;
-use indicatif::ProgressBar;
-use std::sync::{Arc, Mutex};
-use crossbeam::channel::bounded;
-use crossbeam::scope;
+use std::fs::{File, read_dir};
+use std::io::{BufReader, Read};
+use sha2::{Sha256, Digest};
+
+/// 160-bit p2pkh (pay-to-public-key-hash) address.
+pub const ADDRESS_HASH_LENGTH: usize = 20usize;
+pub type AddressHash = [u8; ADDRESS_HASH_LENGTH];
 
 /// Extract Bitcoin addresses from transaction outputs (TxOut).
-fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<Address> {
-    Address::from_script(&txout.script_pubkey, network).ok()
+fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<AddressHash> {
+    match Address::from_script(&txout.script_pubkey, network).ok() {
+        Some(address) => {
+            match address.address_type() {
+                Some(bitcoin::AddressType::P2pkh) => {
+                    let address_hash= address.pubkey_hash()?.to_byte_array();
+                    // println!("Address: {:#}", address);
+                    Some(address_hash)
+                },
+                _ => None,
+            }
+        },
+        None => None,
+    }
 }
 
 /// Extract all addresses from transactions in a block.
-fn extract_addresses_from_block(block: &Block, network: Network) -> HashSet<Address> {
+fn extract_addresses_from_block(block: &Block, network: Network) -> HashSet<AddressHash> {
     let mut addresses = HashSet::new();
 
     for tx in &block.txdata {
@@ -29,7 +45,7 @@ fn extract_addresses_from_block(block: &Block, network: Network) -> HashSet<Addr
 }
 
 /// Parse a blk*.dat file and extract all unique addresses.
-fn extract_addresses_from_block_file(path: String) -> Result<HashSet<Address>, Box<dyn std::error::Error>> {
+fn extract_addresses_from_block_file(path: String) -> Result<HashSet<AddressHash>, Box<dyn std::error::Error>> {
     let network = Network::Bitcoin;
     let mut addresses = HashSet::new();
 
@@ -71,12 +87,14 @@ fn extract_addresses_from_block_file(path: String) -> Result<HashSet<Address>, B
     Ok(addresses)
 }
 
-/// Process all `blk*.dat` files in a folder and return unique addresses.
-pub fn extract_addresses_from_folder(
-    folder_path: &str,
-) -> Result<HashSet<Address>, Box<dyn std::error::Error>> {
+/// Process all `blk*.dat` files in a folder
+pub fn load_unique_addresses_into_database(
+    block_dir: &str,
+    db: &sled::Db,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Get all files in the folder
-    let paths = fs::read_dir(folder_path)?
+    let paths = read_dir(block_dir)?
         .filter_map(|entry| entry.ok()) // Ignore errors
         .filter(|entry| {
             // Only include files with names starting with "blk" and ending in ".dat"
@@ -89,42 +107,21 @@ pub fn extract_addresses_from_folder(
         .map(|entry| entry.path().to_string_lossy().to_string()) // Convert paths to strings
         .collect::<Vec<String>>();
 
-    let pb = ProgressBar::new(paths.len() as u64);
-    let file_queue = Arc::new(Mutex::new(paths));
-    // let (tx, rx) = mpsc::channel::<HashSet<Address>>();
-    let (tx, rx) = bounded::<HashSet<Address>>(10);
-
-    // Spawn worker threads
-    let num_workers = std::thread::available_parallelism()?;
-    scope(|s| {
-        for _ in 0..num_workers.into() {
-            let file_queue = Arc::clone(&file_queue);
-            let tx = tx.clone();
-            s.spawn(move |_| {
-                while let Some(path) = {
-                    let mut queue = file_queue.lock().unwrap();
-                    queue.pop()
-                } {
-                    match extract_addresses_from_block_file(path) {
-                        Ok(addresses) => {
-                            tx.send(addresses).unwrap();
-                        }
-                        Err(err) => {
-                            eprintln!("Error processing file: {}", err);
-                        }
-                    }
+    pb.set_length(paths.len() as u64);
+    paths.par_iter().progress_with(pb.clone()).for_each(|path| {
+        match extract_addresses_from_block_file(path.to_string()) {
+            Ok(addresses) => {
+                let mut batch = sled::Batch::default();
+                for address in addresses {
+                    batch.insert(Sha256::digest(&address).to_vec(), &address);
                 }
-            });
+                db.apply_batch(batch).unwrap();
+            }
+            Err(err) => {
+                eprintln!("Error processing file: {}", err);
+            }
         }
+    });
 
-        drop(tx);
-
-        let mut addresses = HashSet::new();
-        for batch in rx {
-            addresses.extend(batch);
-            pb.inc(1);
-        }
-
-        Ok(addresses)
-    }).unwrap()
+    Ok(())
 }

@@ -1,206 +1,322 @@
-use bitcoin::address::NetworkUnchecked;
 use bitcoin::Address;
 use boomphf::Mphf;
-use heed::{Env, EnvOpenOptions, Database, types::*, byteorder, RoTxn};
-use indicatif::{ProgressBar, ProgressIterator};
-use std::collections::HashSet;
+use crossbeam::channel;
+use hex;
+use indicatif::{ParallelProgressIterator, ProgressBar};
+use memmap2::{MmapMut, Mmap};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use sled;
+use std::convert::TryInto;
+use std::error::Error;
 use std::fs;
 use std::fs::File;
-use std::path::Path;
-use std::str::FromStr;
-use std::time::Duration;
+use std::fs::OpenOptions;
 use std::io::Write;
-use std::error::Error;
+use std::io::{BufReader, BufWriter, Read};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::str::FromStr;
+use bitcoin::hashes::Hash;
+use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 
+use crate::block_scanner::{AddressHash, ADDRESS_HASH_LENGTH};
+
+/// Constants for the full SHA256 hash space.
+const SHA256_FULL_RANGE_START: [u8; 32] = [0x00; 32];
+const SHA256_FULL_RANGE_END: [u8; 32] = [0xFF; 32];
+
+/// Compute the starting key for a partition.
+fn compute_sha256_partition_key(partition_index: usize, n_partitions: usize) -> Vec<u8> {
+    let start = u128::from_be_bytes(SHA256_FULL_RANGE_START[0..16].try_into().unwrap());
+    let end = u128::from_be_bytes(SHA256_FULL_RANGE_END[0..16].try_into().unwrap());
+    let range = end - start;
+
+    let step = range / n_partitions as u128;
+    let offset = step * partition_index as u128;
+
+    let mut key = [0x00; 32];
+    key[0..16].copy_from_slice(&(start + offset).to_be_bytes());
+    key.to_vec()
+}
+
+/// Partition the SHA256 key space into start and end ranges.
+fn compute_sha256_partitions(n_partitions: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..n_partitions)
+        .map(|i| {
+            let start = compute_sha256_partition_key(i, n_partitions);
+            let end = if i == n_partitions - 1 {
+                SHA256_FULL_RANGE_END.to_vec()
+            } else {
+                compute_sha256_partition_key(i + 1, n_partitions)
+            };
+            (start, end)
+        })
+        .collect()
+}
+
+/// Create staging files for each partition of the SHA256 key space.
+pub fn create_staging_files(db: &sled::Db, staging_dir: &Path, n_partitions: usize, pb: &ProgressBar) -> Result<(), Box<dyn Error>>{
+    let partition_ranges = compute_sha256_partitions(n_partitions);
+    pb.set_length(partition_ranges.len() as u64);
+    partition_ranges.into_par_iter().progress_with(pb.clone()).for_each(|(start, end)| {
+        let staging_file_path = staging_dir.join(format!("staging_{}_{}.db", hex::encode(&start), hex::encode(&end)));
+        let staging_file = File::create(&staging_file_path).unwrap();
+        let mut writer = BufWriter::new(staging_file);
+        for result in db.range(start..end) {
+            let (_, value) = result.unwrap();
+            let address = value.to_vec();
+            writer.write_all(&address).unwrap();
+        }
+        writer.flush().unwrap();
+    });
+
+    Ok(())
+}
+
+/// Iterator over addresses in a staging file.
+pub struct StagingAddressIterator {
+    reader: BufReader<File>,
+    remaining: usize,
+}
+
+impl StagingAddressIterator {
+    pub fn new(file: File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        let file_size = metadata.size() as usize;
+        let remaining = file_size / ADDRESS_HASH_LENGTH;
+
+        Ok(Self {
+            reader: BufReader::new(file),
+            remaining,
+        })
+    }
+}
+
+impl Iterator for StagingAddressIterator {
+    type Item = AddressHash;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let mut buffer = AddressHash::default();
+        match self.reader.read_exact(&mut buffer) {
+            Ok(_) => {
+                self.remaining -= 1;
+                Some(buffer)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if n >= self.remaining {
+            self.remaining = 0;
+            return None;
+        }
+
+        let skip_bytes = n * ADDRESS_HASH_LENGTH;
+        if self.reader.seek(SeekFrom::Current(skip_bytes as i64)).is_err() {
+            return None;
+        }
+
+        self.remaining -= n;
+        self.next()
+    }
+}
+
+impl ExactSizeIterator for StagingAddressIterator {
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+/// Iterator over files containing addresses.
+struct AddressFilesIterator {
+    files: Vec<PathBuf>,
+}
+
+impl AddressFilesIterator {
+    fn new(files: Vec<PathBuf>) -> Self {
+        Self { files }
+    }
+}
+
+impl<'a> IntoIterator for &'a AddressFilesIterator {
+    type Item = StagingAddressIterator;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.files
+            .iter()
+            .map(|file_path| {
+                let file = File::open(file_path).unwrap();
+                StagingAddressIterator::new(file).expect("Could not create iterator")
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+fn staging_dir_files(staging_dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(staging_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            entry.ok().and_then(|e| {
+                let path = e.path();
+                if path.is_file() {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+fn address_count_from_files(files: &Vec<PathBuf>) -> u64 {
+    let total_bytes: u64 = files
+        .iter()
+        .filter_map(|file| fs::metadata(file).ok().map(|m| m.len()))
+        .sum();
+
+    assert_eq!(total_bytes % (ADDRESS_HASH_LENGTH as u64), 0);
+    total_bytes / (ADDRESS_HASH_LENGTH as u64)
+}
+
+/// Creates a MPHF from staging files.
+pub fn create_mphf(staging_dir: &Path, gamma: f64) -> Result<Mphf<AddressHash>, Box<dyn Error>> {
+    let files = staging_dir_files(&staging_dir);
+    let n = address_count_from_files(&files);
+    let chunk_iterator = AddressFilesIterator::new(files);
+    let mphf = Mphf::from_chunked_iterator(gamma, &chunk_iterator, n);
+    // TODO: switch to the following if performance requires it, but we'll need to implement Clone for AddressFilesIterator first.
+    // let num_threads = std::thread::available_parallelism()?;
+    // let mphf = Mphf::from_chunked_iterator_parallel(gamma, &chunk_iterator, None, n, num_threads);
+    Ok(mphf)
+}
+
+/// Serializes the MPHF to a file.
+pub fn save_mphf(index_dir: &Path, mphf: &Mphf<AddressHash>) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(index_dir.join("mphf.bin"))?;
+    bincode::serialize_into(&mut file, mphf)?;
+    Ok(())
+}
+
+fn load_mphf(index_dir: &Path) -> Result<Mphf<AddressHash>, Box<dyn Error>> {
+    let file = File::open(index_dir.join("mphf.bin"))?;
+    let mphf = bincode::deserialize_from(file)?;
+    Ok(mphf)
+}
+
+/// Uses a MPHF to build an index file where each address is stored at the hashed offset.
+pub fn create_index(
+    mphf: &Mphf<AddressHash>,
+    staging_dir: &Path,
+    index_dir: &Path,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn Error>> {
+    // Determine the size of the output index file
+    let files = staging_dir_files(&staging_dir);
+    let n = address_count_from_files(&files);
+    let index_file_path = index_dir.join("index.bin");
+    let file_size = n as u64 * ADDRESS_HASH_LENGTH as u64;
+
+    // Create and memory-map the output file
+    let index_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&index_file_path)?;
+    index_file.set_len(file_size)?;
+    let mut mmap = unsafe { MmapMut::map_mut(&index_file)? };
+
+    // Create a channel for worker threads to send (offset, address) tuples
+    let (tx, rx) = channel::bounded::<(usize, AddressHash)>(1024);
+
+    // Spawn worker threads to process staging files
+    let worker_handles: Vec<_> = files
+        .into_iter()
+        .map(|file_path| {
+            let tx = tx.clone();
+            let mphf = mphf.clone(); // Clone Arc-wrapped MPHF for thread-safe sharing
+            thread::spawn(move || {
+                let file = File::open(file_path).unwrap();
+                let mut address_iterator = StagingAddressIterator::new(file).unwrap();
+
+                // Iterate over addresses in the file
+                while let Some(address) = address_iterator.next() {
+                    if let Some(index) = mphf.try_hash(&address) {
+                        tx.send((index as usize, address)).unwrap();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Drop the sender to signal the main thread when workers are done
+    drop(tx);
+
+    // Process received (offset, address) tuples and write them to the mmap
+    pb.set_length(n);
+    for (offset, address) in rx {
+        mmap[offset * ADDRESS_HASH_LENGTH..(offset + 1) * ADDRESS_HASH_LENGTH]
+            .copy_from_slice(&address);
+        pb.inc(1);
+    }
+
+    // Ensure all writes are flushed
+    mmap.flush()?;
+
+    // Wait for all worker threads to finish
+    for handle in worker_handles {
+        handle.join().expect("Worker thread panicked");
+    }
+
+    Ok(())
+}
+
+/// Address Index with O(1) lookups.
 pub struct AddressIndex {
-    mphf: Mphf<Address<NetworkUnchecked>>,
-    env: Env,
+    mphf: Mphf<AddressHash>,
+    mmap: Mmap,
 }
 
 impl AddressIndex {
+    /// Creates a new `AddressIndex` from a given `index_dir`.
+    pub fn new(index_dir: &Path) -> Result<Self, Box<dyn Error>> {
+        let mphf = load_mphf(index_dir)?;
+        let index_file_path = index_dir.join("index.bin");
+        let index_file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .create(false)
+            .open(&index_file_path)?;
+        let mmap = unsafe { Mmap::map(&index_file)? };
 
-    fn env_open(dir: &Path) -> Result<Env, Box<dyn Error>> {
-        unsafe {
-            let env = EnvOpenOptions::new()
-                .map_size(10 * 1024 * 1024 * 1024) // 10 GiB
-                .open(dir)?;
-            Ok(env)
-        }
+        Ok(Self { mphf, mmap })
     }
 
-    /// Create a new `AddressIndex` with a given MPHF and a set of addresses.
-    pub fn create(
-        dir: &Path,
-        addresses: &HashSet<Address>,
-        mphf_load_factor: f64,
-    ) -> Result<(), Box<dyn Error>> {
-        // Build the MPHF
-        let pb = ProgressBar::new_spinner();
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message("Constructing MPHF");
-        let addresses_unchecked: Vec<Address<NetworkUnchecked>> =
-            addresses.iter().map(|a| a.clone().into_unchecked()).collect();
-        let mphf = Mphf::new_parallel(mphf_load_factor, &addresses_unchecked, None);
-        pb.finish_with_message("MPHF constructed");
-
-        // Ensure the directory exists
-        std::fs::create_dir_all(dir)?;
-
-        // serialize mphf to a file in the folder using bincode
-        let mphf_bytes = bincode::serialize(&mphf).unwrap();
-        let mut mphf_file = File::create(dir.join("mphf.bin")).unwrap();
-        mphf_file.write_all(&mphf_bytes).unwrap();
-
-        // Create or open the LMDB environment and database
-        let env = Self::env_open(&dir)?;
-        let mut wtxn = env.write_txn()?;
-        let db: Database<U64<byteorder::NativeEndian>, SerdeBincode<Address<NetworkUnchecked>>> =
-            env.create_database(&mut wtxn, None)?;
-
-        // Populate the database
-        for address in (&addresses_unchecked).iter().progress() {
-            if let Some(hash) = mphf.try_hash(address) {
-                db.put(&mut wtxn, &hash, address)?;
-            }
-        }
-        wtxn.commit()?;
-
-        // Read final count from database
-        let index = Self { mphf, env };
-        let count = index.len();
-        pb.finish_with_message(format!("Index populated with {} addresses", count));
-
-        Ok(())
-    }
-
-    pub fn load(dir: &Path) -> Result<Self, Box<dyn Error>> {
-        let mphf: Mphf<Address<NetworkUnchecked>> = bincode::deserialize(&fs::read(dir.join("mphf.bin"))?)?;
-        let env = Self::env_open(dir)?;
-        Ok(Self { mphf, env })
-    }
-
-    pub fn read_txn(&self) -> Result<(Database<U64<byteorder::NativeEndian>, SerdeBincode<Address<NetworkUnchecked>>>, RoTxn), Box<dyn Error>> {
-        let rtxn = self.env.read_txn()?;
-        let db = self
-            .env
-            .open_database::<U64<byteorder::NativeEndian>, SerdeBincode<Address<NetworkUnchecked>>>(&rtxn, None)?
-            .ok_or("Could not open database")?;
-        Ok((db, rtxn))
-    }
-
+    /// Check if the index contains a given "hex formatted" bitcoin p2pkh address
     pub fn contains_address_str(&self, formatted_address: &str) -> bool {
-        let address = Address::from_str(formatted_address).unwrap();
-        self.contains_address(&address)
+        let addr = Address::from_str(formatted_address).unwrap().assume_checked();
+        assert!(addr.address_type() == Some(bitcoin::AddressType::P2pkh));
+        let address: AddressHash = addr.pubkey_hash().unwrap().to_byte_array();
+        self.contains_address_hash(&address)
     }
 
-    pub fn contains_address(&self, address: &Address<NetworkUnchecked>) -> bool {
+    /// Check if the index contains a given p2pkh address (bytes)
+    pub fn contains_address_hash(&self, address: &AddressHash) -> bool {
         match self.mphf.try_hash(address) {
-            Some(index) => {
-                if let Ok((db, rtxn)) = self.read_txn() {
-                    db.get(&rtxn, &index)
-                        .map(|opt| opt.map_or(false, |stored| stored == *address))
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            }
+            Some(hash) => {
+                let mut found_address = AddressHash::default();
+                let (start, end) = (hash as usize * ADDRESS_HASH_LENGTH, (hash as usize + 1) * ADDRESS_HASH_LENGTH);
+                found_address.copy_from_slice(&self.mmap[start..end]);
+                found_address == *address
+            },
             None => false,
         }
-    }
-
-    pub fn len(&self) -> u64 {
-        let (db, rtxn) = self.read_txn().unwrap();
-        db.len(&rtxn).unwrap()
-    }
-
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-    use std::collections::HashSet;
-    use std::str::FromStr;
-
-    #[test]
-    fn test_membership() -> Result<(), Box<dyn std::error::Error>> {
-        // Create test index
-        let formatted_addresses = [
-            "bc1qrat292ehvxrv9qzfatswcqglymvk2mcw2jktny",
-            "185AVLjTpLjXDpMTungGgoFsTrteixGNWB",
-            "bc1qla25lharlzckesmfru8efdyd65jzy979svzq0ek09vasv23pn5rqp9rvvf",
-        ];
-
-        let addresses: HashSet<Address> = formatted_addresses
-            .iter()
-            .map(|addr| Address::from_str(addr).unwrap().assume_checked())
-            .collect();
-
-        let dir = tempdir()?;
-        AddressIndex::create(dir.path(), &addresses, 1.7)?;
-
-        let index = AddressIndex::load(dir.path())?;
-
-        // Check index length
-        assert_eq!(
-            index.len(),
-            formatted_addresses.len() as u64,
-            "Index length does not match expected length"
-        );
-
-        // Check that all known addresses are in the index
-        for addr in &formatted_addresses {
-            assert!(
-                index.contains_address_str(addr),
-                "Address {:?} not found in the index",
-                addr
-            );
-        }
-
-        // Check that an unknown address is not in the index
-        let unknown_address = "3D6YwwRAsyEEZHhkUaJC3gYtBN7FxKpyPC";
-        assert!(
-            !index.contains_address_str(unknown_address),
-            "Unknown address was incorrectly found in the index"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_save_and_load() -> Result<(), Box<dyn std::error::Error>> {
-        let formatted_addresses = [
-            "bc1qrat292ehvxrv9qzfatswcqglymvk2mcw2jktny",
-            "185AVLjTpLjXDpMTungGgoFsTrteixGNWB",
-            "bc1qla25lharlzckesmfru8efdyd65jzy979svzq0ek09vasv23pn5rqp9rvvf",
-        ];
-
-        let addresses: HashSet<Address> = formatted_addresses
-            .iter()
-            .map(|addr| Address::from_str(addr).unwrap().assume_checked())
-            .collect();
-
-        let dir = tempdir()?;
-        AddressIndex::create(dir.path(), &addresses, 1.7)?;
-
-        let index = AddressIndex::load(dir.path())?;
-
-        // Ensure all addresses can be looked up in the loaded index
-        for addr in &formatted_addresses {
-            assert!(
-                index.contains_address_str(addr),
-                "Address {:?} not found in the loaded index",
-                addr
-            );
-        }
-
-        // Check length consistency
-        assert_eq!(
-            index.len(),
-            formatted_addresses.len() as u64,
-            "Loaded index length does not match expected length"
-        );
-
-        Ok(())
     }
 }

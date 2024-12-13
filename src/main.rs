@@ -2,6 +2,8 @@ mod address_index;
 mod block_scanner;
 use clap::{Parser, Subcommand};
 use std::time::Instant;
+use sled;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -33,22 +35,68 @@ enum Commands {
     },
 }
 
-fn build_index(block_dir: &str, index_dir: &str, factor: f64) -> Result<(), Box<dyn std::error::Error>> {
-    let addresses = block_scanner::extract_addresses_from_folder(block_dir)?;
-    address_index::AddressIndex::create(
-        std::path::Path::new(&index_dir),
-        &addresses,
-        factor
-    )?;
+fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<dyn std::error::Error>> {
+    let index_dir = std::path::Path::new(index_dir);
+    let multi_progress = MultiProgress::new();
+    let bar_style = ProgressStyle::default_bar()
+        .template("{msg} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
+        .unwrap()
+        .progress_chars("#>-");
+    let spinner_style = ProgressStyle::default_spinner()
+        .template("{msg} {spinner:.cyan/blue}")
+        .unwrap();
+
+    // Step 1: Create a sled database, populate with unique addresses
+    let sled_dir = index_dir.join("sled");
+    std::fs::create_dir_all(&sled_dir)?;
+    let db = sled::open(&sled_dir)?;
+
+    let step1_pb = multi_progress.add(ProgressBar::new(0).with_style(bar_style.clone()));
+    step1_pb.set_message("Step 1: Scanning block files and populating database");
+    let start = Instant::now();
+    block_scanner::load_unique_addresses_into_database(block_dir, &db, &step1_pb)?;
+    step1_pb.finish_with_message(format!("Step 1: Done in {:.2?}", start.elapsed()));
+
+    // Step 2: Create staging files
+    let staging_dir = index_dir.join("staging");
+    std::fs::create_dir_all(&staging_dir)?;
+
+    let step2_pb = multi_progress.add(ProgressBar::new(0).with_style(bar_style.clone()));
+    step2_pb.set_message("Step 2: Creating staging files");
+    let start = Instant::now();
+    address_index::create_staging_files(&db, &staging_dir, 16usize, &step2_pb)?;
+    step2_pb.finish_with_message(format!("Step 2: Done in {:.2?}", start.elapsed()));
+
+    // Step 3: Create MPHF
+    let step3_pb = multi_progress.add(ProgressBar::new_spinner().with_style(spinner_style.clone()));
+    step3_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    step3_pb.set_message("Step 3: Creating MPHF");
+    let start = Instant::now();
+    let mphf = address_index::create_mphf(&staging_dir, gamma)?;
+    address_index::save_mphf(&index_dir, &mphf)?;
+    step3_pb.finish_with_message(format!("Step 3: Done in {:.2?}", start.elapsed()));
+
+    // Step 4: Create the final index
+    let step4_pb = multi_progress.add(ProgressBar::new(0).with_style(bar_style.clone()));
+    step4_pb.set_message("Step 4: Creating final index");
+    let start = Instant::now();
+    address_index::create_index(&mphf, &staging_dir, &index_dir, &step4_pb)?;
+    step4_pb.finish_with_message(format!("Step 4: Done in {:.2?}", start.elapsed()));
+
+    // Step 5: Clean up temporary directories
+    std::fs::remove_dir_all(staging_dir)?;
+    std::fs::remove_dir_all(sled_dir)?;
 
     Ok(())
 }
 
 fn query_index(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // For testing:
+    //      14YhipytTEvpBaSX5hRnC1QoRUCpn5b9M2 randomly generated, should not be found
+    //      1A1Q3o2N9kAJsbXhtyDU6AZxV5XkZP8iR7 should be present in blk02507.dat
+
     println!("Querying index {} for address {}", index_dir, formatted_address);
-
-    let index = address_index::AddressIndex::load(&std::path::Path::new(&index_dir))?;
-
+    let index = address_index::AddressIndex::new(&std::path::Path::new(&index_dir))?;
     let start = Instant::now();
     let result = index.contains_address_str(formatted_address);
     let duration = start.elapsed();
