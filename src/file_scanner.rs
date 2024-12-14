@@ -8,6 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use std::collections::HashSet;
 use hex;
+use quick_cache::sync::Cache;
 
 use crate::address_index::AddressIndex;
 use crate::crypto::{SK, PKH, sk_to_pk_hash, pkh_to_bitcoin_address};
@@ -68,14 +69,20 @@ pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
     let reader_thread = {
         let work_tx = work_tx.clone();
         let pb = Arc::clone(&pb);
+        let cache = Cache::<SK, ()>::new(1024usize);
+
         std::thread::spawn(move || {
             let mut buffer = [0u8; 32];
             for offset in 0..file_size.saturating_sub(31) {
                 buffer.copy_from_slice(&mmap[offset..offset + 32]);
-                work_tx.send(buffer).unwrap();
+                let _ = cache.get_or_insert_with(&buffer, || {
+                    work_tx.send(buffer).unwrap();
+                    Ok::<(), ()>(())
+                });
                 pb.inc(1);
             }
             drop(work_tx);
+            println!("Scan complete. cache hits = {}, cache_misses = {}", cache.hits(), cache.misses());
         })
     };
 

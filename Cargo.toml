@@ -22,6 +22,7 @@ rocksdb = "0.22.0"
 secp256k1 = { version = "0.30.0", features = ["global-context"] }
 bitcoin_hashes = "0.15.0"
 bs58 = "0.5.1"
+quick_cache = { version = "0.6.9", features = ["stats"] }
 
 [dev-dependencies]
 hex-literal = "0.4.1"
