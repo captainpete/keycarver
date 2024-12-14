@@ -1,37 +1,49 @@
-use std::path::Path;
 use bitcoin::hashes::Hash;
 use bitcoin::{consensus::deserialize, Address, Block, Network, TxOut};
 use indicatif::{ParallelProgressIterator, ProgressBar};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use rocksdb::{Options, DB, WriteBatch};
+use rocksdb::{Options, WriteBatch, DB};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::{File, read_dir};
+use std::fs::{read_dir, File};
 use std::io::{BufReader, Read};
-use sha2::{Sha256, Digest};
+use std::path::Path;
 
-/// 160-bit p2pkh (pay-to-public-key-hash) address.
-pub const ADDRESS_HASH_LENGTH: usize = 20usize;
-pub type AddressHash = [u8; ADDRESS_HASH_LENGTH];
+use crate::crypto::PKH;
 
 /// Extract Bitcoin addresses from transaction outputs (TxOut).
-fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<AddressHash> {
+fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<PKH> {
     match Address::from_script(&txout.script_pubkey, network).ok() {
         Some(address) => {
             match address.address_type() {
                 Some(bitcoin::AddressType::P2pkh) => {
-                    let address_hash= address.pubkey_hash()?.to_byte_array();
+                    let address_hash = address.pubkey_hash()?.to_byte_array();
                     // println!("Address: {:#}", address);
                     Some(address_hash)
-                },
+                }
+                Some(bitcoin::AddressType::P2wpkh) => {
+                    if let Some(witness_program) = address.witness_program() {
+                        let program = witness_program.program();
+                        if program.len() == 20 {
+                            let mut pkh = [0u8; 20];
+                            pkh.copy_from_slice(&program.as_bytes());
+                            Some(pkh)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             }
-        },
+        }
         None => None,
     }
 }
 
 /// Extract all addresses from transactions in a block.
-fn extract_addresses_from_block(block: &Block, network: Network) -> HashSet<AddressHash> {
+fn extract_addresses_from_block(block: &Block, network: Network) -> HashSet<PKH> {
     let mut addresses = HashSet::new();
 
     for tx in &block.txdata {
@@ -46,7 +58,7 @@ fn extract_addresses_from_block(block: &Block, network: Network) -> HashSet<Addr
 }
 
 /// Parse a blk*.dat file and extract all unique addresses.
-fn extract_addresses_from_block_file(path: String) -> Result<HashSet<AddressHash>, Box<dyn std::error::Error>> {
+fn extract_addresses_from_block_file(path: String) -> Result<HashSet<PKH>, Box<dyn std::error::Error>> {
     let network = Network::Bitcoin;
     let mut addresses = HashSet::new();
 
