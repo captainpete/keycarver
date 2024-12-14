@@ -31,7 +31,7 @@ pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
 
     // Memory-map the file
     let file = File::open(file_path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     let file_size = mmap.len();
 
     let pb = Arc::new(ProgressBar::new(file_size as u64).with_style(
@@ -42,42 +42,34 @@ pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
     ));
     pb.set_message("Scanning");
 
-    // Channels for work distribution and matched keys
-    let (work_tx, work_rx) = channel::bounded::<SK>(1024);
+    // Channels for matched keys
     let (key_tx, key_rx) = channel::bounded::<(SK, PKH)>(1024);
 
     // Spawn worker threads
     let num_workers = rayon::current_num_threads();
     let workers: Vec<_> = (0..num_workers)
-        .map(|_| {
-            let work_rx = work_rx.clone();
+        .map(|worker_id| {
             let key_tx = key_tx.clone();
             let index = Arc::clone(&index);
+            let mmap = Arc::clone(&mmap);
+            let pb = Arc::clone(&pb);
 
             std::thread::spawn(move || {
-                while let Ok(sk) = work_rx.recv() {
-                    if let Some(pkh) = check_bytes(&sk, &index) {
-                        key_tx.send((sk, pkh)).unwrap();
+                let mut buffer = [0u8; 32];
+
+                // Each worker starts at its own offset and steps by the number of workers
+                for offset in (worker_id..file_size.saturating_sub(31)).step_by(num_workers) {
+                    buffer.copy_from_slice(&mmap[offset..offset + 32]);
+
+                    if let Some(pkh) = check_bytes(&buffer, &index) {
+                        key_tx.send((buffer, pkh)).unwrap();
                     }
+
+                    pb.inc(1);
                 }
             })
         })
         .collect();
-
-    // Reader thread to push keys into the work channel
-    let reader_thread = {
-        let work_tx = work_tx.clone();
-        let pb = Arc::clone(&pb);
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 32];
-            for offset in 0..file_size.saturating_sub(31) {
-                buffer.copy_from_slice(&mmap[offset..offset + 32]);
-                work_tx.send(buffer).unwrap();
-                pb.inc(1);
-            }
-            drop(work_tx);
-        })
-    };
 
     // Main thread processes keys from the key channel
     let mut recovered: HashSet<SK> = HashSet::new();
@@ -85,18 +77,19 @@ pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
         while let Ok((sk, pkh)) = key_rx.recv() {
             if !recovered.contains(&sk) {
                 let bitcoin_address = pkh_to_bitcoin_address(&pkh);
-                println!("priv: {}, pkh: {}, addr: {}", hex::encode(&sk), hex::encode(&pkh), bitcoin_address);
+                println!(
+                    "priv: {}, pkh: {}, addr: {}",
+                    hex::encode(&sk),
+                    hex::encode(&pkh),
+                    bitcoin_address
+                );
                 recovered.insert(sk);
             }
         }
         recovered.len()
     });
 
-    // Wait for the reader to finish
-    reader_thread.join().expect("Reader thread panicked");
-
     // Drop the sender to signal workers when done
-    drop(work_tx);
     drop(key_tx);
 
     // Wait for all workers to finish
