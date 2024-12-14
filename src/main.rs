@@ -108,7 +108,7 @@ fn query_index(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn s
     //      14YhipytTEvpBaSX5hRnC1QoRUCpn5b9M2 randomly generated, should not be found
     //      1A1Q3o2N9kAJsbXhtyDU6AZxV5XkZP8iR7 should be present in blk02507.dat
 
-    println!("Querying index {} for address {}", index_dir, formatted_address);
+    eprintln!("Querying index {} for address {}", index_dir, formatted_address);
     let index = address_index::AddressIndex::new(&Path::new(&index_dir))?;
     let start = Instant::now();
     let result = index.contains_address_str(formatted_address);
@@ -123,10 +123,10 @@ fn query_index(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn s
 }
 
 fn scan(file_path: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Scanning {} using {}", file_path, index_dir);
+    eprintln!("Scanning {} using {}", file_path, index_dir);
     let start = Instant::now();
     let n_found = file_scanner::scan(&Path::new(&file_path), &Path::new(&index_dir))?;
-    println!("Found {} key/s in {:?}", n_found, start.elapsed());
+    eprintln!("Found {} key/s in {:?}", n_found, start.elapsed());
     Ok(())
 }
 

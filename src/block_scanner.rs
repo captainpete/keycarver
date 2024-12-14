@@ -18,7 +18,6 @@ fn extract_addresses_from_txout(txout: &TxOut, network: Network) -> Option<PKH> 
             match address.address_type() {
                 Some(bitcoin::AddressType::P2pkh) => {
                     let address_hash = address.pubkey_hash()?.to_byte_array();
-                    // println!("Address: {:#}", address);
                     Some(address_hash)
                 }
                 Some(bitcoin::AddressType::P2wpkh) => {

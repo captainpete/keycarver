@@ -82,7 +82,7 @@ pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
                 pb.inc(1);
             }
             drop(work_tx);
-            println!("Scan complete. cache hits = {}, cache_misses = {}", cache.hits(), cache.misses());
+            eprintln!("Scan complete. cache hits = {}, cache_misses = {}", cache.hits(), cache.misses());
         })
     };
 
