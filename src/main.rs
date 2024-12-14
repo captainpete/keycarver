@@ -144,9 +144,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
-// TODO:
-// 3. Write a public key generator that uses big-endian bytes from files as private keys - move into module
-// 4. For each public key, generate the addresses associated (check out https://docs.rs/bitcoin/latest/src/bitcoin/address/mod.rs.html#631-639)
-// 5. For each of these addresses, check if they're in the index
-// 6. Parallelize the whole thing using rayon
