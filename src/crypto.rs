@@ -22,6 +22,7 @@ pub fn sk_to_pk_compressed(bytes: &SK) -> Option<[u8; 33]> {
     }
 }
 
+#[allow(dead_code)]
 pub fn sk_to_pk_uncompressed(bytes: &SK) -> Option<[u8; 65]> {
     if let Some(sk) = sk_from_slice(bytes) {
         Some(PublicKey::from_secret_key_global(&sk).serialize_uncompressed())
