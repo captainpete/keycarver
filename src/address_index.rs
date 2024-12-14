@@ -20,7 +20,7 @@ use bitcoin::hashes::Hash;
 use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 
-use crate::block_scanner::{AddressHash, ADDRESS_HASH_LENGTH};
+use crate::crypto::{PKH, PKH_LENGTH};
 
 /// Constants for the full SHA256 hash space.
 const SHA256_FULL_RANGE_START: [u8; 32] = [0x00; 32];
@@ -93,7 +93,7 @@ impl StagingAddressIterator {
     pub fn new(file: File) -> std::io::Result<Self> {
         let metadata = file.metadata()?;
         let file_size = metadata.size() as usize;
-        let remaining = file_size / ADDRESS_HASH_LENGTH;
+        let remaining = file_size / PKH_LENGTH;
 
         Ok(Self {
             reader: BufReader::new(file),
@@ -103,14 +103,14 @@ impl StagingAddressIterator {
 }
 
 impl Iterator for StagingAddressIterator {
-    type Item = AddressHash;
+    type Item = PKH;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
 
-        let mut buffer = AddressHash::default();
+        let mut buffer = PKH::default();
         match self.reader.read_exact(&mut buffer) {
             Ok(_) => {
                 self.remaining -= 1;
@@ -126,7 +126,7 @@ impl Iterator for StagingAddressIterator {
             return None;
         }
 
-        let skip_bytes = n * ADDRESS_HASH_LENGTH;
+        let skip_bytes = n * PKH_LENGTH;
         if self.reader.seek(SeekFrom::Current(skip_bytes as i64)).is_err() {
             return None;
         }
@@ -191,12 +191,12 @@ fn address_count_from_files(files: &Vec<PathBuf>) -> u64 {
         .filter_map(|file| fs::metadata(file).ok().map(|m| m.len()))
         .sum();
 
-    assert_eq!(total_bytes % (ADDRESS_HASH_LENGTH as u64), 0);
-    total_bytes / (ADDRESS_HASH_LENGTH as u64)
+    assert_eq!(total_bytes % (PKH_LENGTH as u64), 0);
+    total_bytes / (PKH_LENGTH as u64)
 }
 
 /// Creates a MPHF from staging files.
-pub fn create_mphf(staging_dir: &Path, gamma: f64) -> Result<Mphf<AddressHash>, Box<dyn Error>> {
+pub fn create_mphf(staging_dir: &Path, gamma: f64) -> Result<Mphf<PKH>, Box<dyn Error>> {
     let files = staging_dir_files(&staging_dir);
     let n = address_count_from_files(&files);
     let chunk_iterator = AddressFilesIterator::new(files);
@@ -208,13 +208,13 @@ pub fn create_mphf(staging_dir: &Path, gamma: f64) -> Result<Mphf<AddressHash>, 
 }
 
 /// Serializes the MPHF to a file.
-pub fn save_mphf(index_dir: &Path, mphf: &Mphf<AddressHash>) -> Result<(), Box<dyn Error>> {
+pub fn save_mphf(index_dir: &Path, mphf: &Mphf<PKH>) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(index_dir.join("mphf.bin"))?;
     bincode::serialize_into(&mut file, mphf)?;
     Ok(())
 }
 
-fn load_mphf(index_dir: &Path) -> Result<Mphf<AddressHash>, Box<dyn Error>> {
+fn load_mphf(index_dir: &Path) -> Result<Mphf<PKH>, Box<dyn Error>> {
     let file = File::open(index_dir.join("mphf.bin"))?;
     let mphf = bincode::deserialize_from(file)?;
     Ok(mphf)
@@ -222,7 +222,7 @@ fn load_mphf(index_dir: &Path) -> Result<Mphf<AddressHash>, Box<dyn Error>> {
 
 /// Uses a MPHF to build an index file where each address is stored at the hashed offset.
 pub fn create_index(
-    mphf: &Mphf<AddressHash>,
+    mphf: &Mphf<PKH>,
     staging_dir: &Path,
     index_dir: &Path,
     pb: &ProgressBar,
@@ -231,7 +231,7 @@ pub fn create_index(
     let files = staging_dir_files(&staging_dir);
     let n = address_count_from_files(&files);
     let index_file_path = index_dir.join("index.bin");
-    let file_size = n as u64 * ADDRESS_HASH_LENGTH as u64;
+    let file_size = n as u64 * PKH_LENGTH as u64;
 
     // Create and memory-map the output file
     let index_file = OpenOptions::new()
@@ -243,7 +243,7 @@ pub fn create_index(
     let mut mmap = unsafe { MmapMut::map_mut(&index_file)? };
 
     // Create a channel for worker threads to send (offset, address) tuples
-    let (tx, rx) = channel::bounded::<(usize, AddressHash)>(1024);
+    let (tx, rx) = channel::bounded::<(usize, PKH)>(1024);
 
     // Spawn worker threads to process staging files
     let worker_handles: Vec<_> = files
@@ -271,7 +271,7 @@ pub fn create_index(
     // Process received (offset, address) tuples and write them to the mmap
     pb.set_length(n);
     for (offset, address) in rx {
-        mmap[offset * ADDRESS_HASH_LENGTH..(offset + 1) * ADDRESS_HASH_LENGTH]
+        mmap[offset * PKH_LENGTH..(offset + 1) * PKH_LENGTH]
             .copy_from_slice(&address);
         pb.inc(1);
     }
@@ -289,7 +289,7 @@ pub fn create_index(
 
 /// Address Index with O(1) lookups.
 pub struct AddressIndex {
-    mphf: Mphf<AddressHash>,
+    mphf: Mphf<PKH>,
     mmap: Mmap,
 }
 
@@ -312,16 +312,16 @@ impl AddressIndex {
     pub fn contains_address_str(&self, formatted_address: &str) -> bool {
         let addr = Address::from_str(formatted_address).unwrap().assume_checked();
         assert!(addr.address_type() == Some(bitcoin::AddressType::P2pkh));
-        let address: AddressHash = addr.pubkey_hash().unwrap().to_byte_array();
+        let address: PKH = addr.pubkey_hash().unwrap().to_byte_array();
         self.contains_address_hash(&address)
     }
 
     /// Check if the index contains a given p2pkh address (bytes)
-    pub fn contains_address_hash(&self, address: &AddressHash) -> bool {
+    pub fn contains_address_hash(&self, address: &PKH) -> bool {
         match self.mphf.try_hash(address) {
             Some(hash) => {
-                let mut found_address = AddressHash::default();
-                let (start, end) = (hash as usize * ADDRESS_HASH_LENGTH, (hash as usize + 1) * ADDRESS_HASH_LENGTH);
+                let mut found_address = PKH::default();
+                let (start, end) = (hash as usize * PKH_LENGTH, (hash as usize + 1) * PKH_LENGTH);
                 found_address.copy_from_slice(&self.mmap[start..end]);
                 found_address == *address
             },
