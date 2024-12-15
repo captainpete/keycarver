@@ -1,9 +1,10 @@
+use bitcoin::hashes::Hash;
 use bitcoin::Address;
 use boomphf::Mphf;
 use crossbeam::channel;
 use hex;
 use indicatif::{ParallelProgressIterator, ProgressBar};
-use memmap2::{MmapMut, Mmap};
+use memmap2::{Mmap, MmapMut};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rocksdb::{Options, DB};
 use std::convert::TryInto;
@@ -11,14 +12,12 @@ use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::BufWriter;
 use std::io::Write;
-use std::io::{BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::str::FromStr;
-use bitcoin::hashes::Hash;
-use std::io::{Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
+use std::thread;
 
 use crate::crypto::{PKH, PKH_LENGTH};
 
@@ -85,20 +84,32 @@ pub fn create_staging_files(db_path: &Path, staging_dir: &Path, n_partitions: us
 
 /// Iterator over addresses in a staging file.
 pub struct StagingAddressIterator {
-    reader: BufReader<File>,
+    mmap: Arc<Mmap>,
     remaining: usize,
+    current_offset: usize,
 }
 
 impl StagingAddressIterator {
     pub fn new(file: File) -> std::io::Result<Self> {
-        let metadata = file.metadata()?;
-        let file_size = metadata.size() as usize;
+        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+        let file_size = mmap.len();
         let remaining = file_size / PKH_LENGTH;
 
         Ok(Self {
-            reader: BufReader::new(file),
+            mmap,
             remaining,
+            current_offset: 0,
         })
+    }
+}
+
+impl Clone for StagingAddressIterator {
+    fn clone(&self) -> Self {
+        Self {
+            mmap: self.mmap.clone(),
+            remaining: self.remaining,
+            current_offset: self.current_offset,
+        }
     }
 }
 
@@ -110,14 +121,14 @@ impl Iterator for StagingAddressIterator {
             return None;
         }
 
+        let start = self.current_offset;
+        let end = start + PKH_LENGTH;
+        self.current_offset = end;
+
         let mut buffer = PKH::default();
-        match self.reader.read_exact(&mut buffer) {
-            Ok(_) => {
-                self.remaining -= 1;
-                Some(buffer)
-            }
-            Err(_) => None,
-        }
+        buffer.copy_from_slice(&self.mmap[start..end]);
+        self.remaining -= 1;
+        Some(buffer)
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
@@ -126,11 +137,7 @@ impl Iterator for StagingAddressIterator {
             return None;
         }
 
-        let skip_bytes = n * PKH_LENGTH;
-        if self.reader.seek(SeekFrom::Current(skip_bytes as i64)).is_err() {
-            return None;
-        }
-
+        self.current_offset += n * PKH_LENGTH;
         self.remaining -= n;
         self.next()
     }
@@ -200,10 +207,8 @@ pub fn create_mphf(staging_dir: &Path, gamma: f64) -> Result<Mphf<PKH>, Box<dyn 
     let files = staging_dir_files(&staging_dir);
     let n = address_count_from_files(&files);
     let chunk_iterator = AddressFilesIterator::new(files);
-    let mphf = Mphf::from_chunked_iterator(gamma, &chunk_iterator, n);
-    // TODO: switch to the following if performance requires it, but we'll need to implement Clone for AddressFilesIterator first.
-    // let num_threads = std::thread::available_parallelism()?;
-    // let mphf = Mphf::from_chunked_iterator_parallel(gamma, &chunk_iterator, None, n, num_threads);
+    let num_threads = thread::available_parallelism()?;
+    let mphf = Mphf::from_chunked_iterator_parallel(gamma, &chunk_iterator, None, n, usize::from(num_threads));
     Ok(mphf)
 }
 
@@ -324,7 +329,7 @@ impl AddressIndex {
                 let (start, end) = (hash as usize * PKH_LENGTH, (hash as usize + 1) * PKH_LENGTH);
                 found_address.copy_from_slice(&self.mmap[start..end]);
                 found_address == *address
-            },
+            }
             None => false,
         }
     }
