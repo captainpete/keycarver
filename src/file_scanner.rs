@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Statistics for tracking processing progress
 #[derive(Default)]
@@ -39,7 +39,11 @@ fn check_bytes(sk: SK, index: &AddressIndex, stats: &Stats) -> Option<(SK, PKH)>
 
 /// Scan a file for potential private keys and count matches against the index.
 pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
+    // Load index
     let index = Arc::new(AddressIndex::new(index_dir)?);
+
+    // Start tracking time after index load
+    let start_time = Instant::now();
 
     // Memory-map the file
     let file = File::open(file_path)?;
@@ -59,9 +63,14 @@ pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
     let stats_clone = Arc::clone(&stats);
     let pb_clone = Arc::clone(&pb);
     thread::spawn(move || loop {
+        let key_count = stats_clone.sk_candidate_count.load(Ordering::Relaxed);
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let mkps = key_count as f64 / elapsed / 1e6;
+
         pb_clone.set_message(format!(
-            "SK candidates: {}, SKs validated: {} ({} unique), cache hits: {}, cache misses: {}",
-            stats_clone.sk_candidate_count.load(Ordering::Relaxed),
+            "SK candidates: {} ({:.3} Mk/s), SKs validated: {} ({} unique), cache hits: {}, cache misses: {}",
+            key_count,
+            mkps,
             stats_clone.sk_validated_count.load(Ordering::Relaxed),
             stats_clone.sk_validated_unique_count.load(Ordering::Relaxed),
             stats_clone.cache_hits.load(Ordering::Relaxed),
