@@ -18,7 +18,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Build an address index from a directory of block files
-    BuildIndex {
+    IndexBuild {
         /// Location of block files
         #[arg(long)]
         block_dir: String,
@@ -30,7 +30,7 @@ enum Commands {
         factor: f64,
     },
     /// Query the address index for a BitCoin p2pkh address
-    QueryAddress {
+    IndexQuery {
         /// Address to check
         #[arg(long)]
         address: String,
@@ -38,8 +38,8 @@ enum Commands {
         #[arg(long)]
         index_dir: String,
     },
-    /// Scan a file for keys using an address index for confirmation
-    Scan {
+    /// Scan by testing keys for every 32-byte sequence in the file
+    ScanRaw {
         /// File to scan
         #[arg(long)]
         file: String,
@@ -49,7 +49,7 @@ enum Commands {
     },
 }
 
-fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<dyn std::error::Error>> {
+fn index_build(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<dyn std::error::Error>> {
     let index_dir = Path::new(index_dir);
     let multi_progress = MultiProgress::new();
     let bar_style = ProgressStyle::default_bar()
@@ -103,7 +103,7 @@ fn build_index(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
     Ok(())
 }
 
-fn query_index(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn index_query(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // For testing:
     //      14YhipytTEvpBaSX5hRnC1QoRUCpn5b9M2 randomly generated, should not be found
     //      1A1Q3o2N9kAJsbXhtyDU6AZxV5XkZP8iR7 should be present in blk02507.dat
@@ -122,7 +122,7 @@ fn query_index(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn scan(file_path: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn scan_raw(file_path: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Scanning {} using {}", file_path, index_dir);
     let start = Instant::now();
     let n_found = file_scanner::scan(&Path::new(&file_path), &Path::new(&index_dir))?;
@@ -134,12 +134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::BuildIndex { block_dir, index_dir, factor } =>
-            build_index(block_dir.as_str(), index_dir.as_str(), factor)?,
-        Commands::QueryAddress { address, index_dir } =>
-            query_index(address.as_str(), index_dir.as_str())?,
-        Commands::Scan { file, index_dir } =>
-            scan(file.as_str(), index_dir.as_str())?
+        Commands::IndexBuild { block_dir, index_dir, factor } =>
+            index_build(block_dir.as_str(), index_dir.as_str(), factor)?,
+        Commands::IndexQuery { address, index_dir } =>
+            index_query(address.as_str(), index_dir.as_str())?,
+        Commands::ScanRaw { file, index_dir } =>
+            scan_raw(file.as_str(), index_dir.as_str())?
     }
 
     Ok(())
