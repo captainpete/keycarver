@@ -38,7 +38,7 @@ fn check_bytes(sk: SK, index: &AddressIndex, stats: &Stats) -> Option<(SK, PKH)>
 }
 
 /// Scan a file for potential private keys and count matches against the index.
-pub fn scan(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
+pub fn scan_raw(file_path: &Path, index_dir: &Path) -> Result<u64, Box<dyn Error>> {
     // Load index
     let index = Arc::new(AddressIndex::new(index_dir)?);
 

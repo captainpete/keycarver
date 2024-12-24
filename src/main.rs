@@ -125,7 +125,7 @@ fn index_query(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn s
 fn scan_raw(file_path: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Scanning {} using {}", file_path, index_dir);
     let start = Instant::now();
-    let n_found = file_scanner::scan(&Path::new(&file_path), &Path::new(&index_dir))?;
+    let n_found = file_scanner::scan_raw(&Path::new(&file_path), &Path::new(&index_dir))?;
     eprintln!("Found {} key/s in {:?}", n_found, start.elapsed());
     Ok(())
 }
@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::IndexQuery { address, index_dir } =>
             index_query(address.as_str(), index_dir.as_str())?,
         Commands::ScanRaw { file, index_dir } =>
-            scan_raw(file.as_str(), index_dir.as_str())?
+            scan_raw(file.as_str(), index_dir.as_str())?,
     }
 
     Ok(())
