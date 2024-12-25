@@ -14,6 +14,12 @@ fn sk_from_slice(bytes: &SK) -> Option<SecretKey> {
         Err(_) => None,
     }
 }
+
+#[inline]
+pub fn hash160(bytes: &[u8]) -> PKH {
+    Ripemd160::hash(&Sha256::hash(&bytes).to_byte_array()).to_byte_array()
+}
+
 pub fn sk_to_pk_compressed(bytes: &SK) -> Option<[u8; 33]> {
     if let Some(sk) = sk_from_slice(bytes) {
         Some(PublicKey::from_secret_key_global(&sk).serialize())
@@ -33,9 +39,7 @@ pub fn sk_to_pk_uncompressed(bytes: &SK) -> Option<[u8; 65]> {
 
 pub fn sk_to_pk_hash(bytes: &SK) -> Option<PKH> {
     if let Some(pk_compressed) = sk_to_pk_compressed(&bytes) {
-        let sha256_hash = Sha256::hash(&pk_compressed).to_byte_array();
-        let ripemd160_hash = Ripemd160::hash(&sha256_hash).to_byte_array();
-        Some(ripemd160_hash)
+        Some(hash160(&pk_compressed))
     } else {
         None
     }
