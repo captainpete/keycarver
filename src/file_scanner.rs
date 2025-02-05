@@ -257,7 +257,11 @@ pub fn scan_raw(
     let key_processing_thread = {
         let stats = Arc::clone(&stats);
         let checkpoint = Arc::clone(&checkpoint);
+        
         let mut recovered: HashSet<SK> = HashSet::new();
+        for recovered_key in checkpoint.lock().unwrap().results.clone() {
+            recovered.insert(recovered_key.sk);
+        }
 
         std::thread::spawn(move || {
             while let Ok(key_message) = key_rx.recv() {
