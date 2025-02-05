@@ -38,11 +38,15 @@ enum Commands {
         #[arg(long)]
         index_dir: String,
     },
-    /// Scan by testing keys for every 32-byte sequence in the file
+    /// Scan by testing keys for every 32-byte sequence in the file.
+    /// Resumes previously interrupted runs using the state file.
     ScanRaw {
         /// File to scan
         #[arg(long)]
         file: String,
+        /// File to hold results / progress
+        #[arg(long)]
+        checkpoint_file: String,
         /// Path to the address index folder
         #[arg(long)]
         index_dir: String,
@@ -122,10 +126,10 @@ fn index_query(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn scan_raw(file_path: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn scan_raw(file_path: &str, state_file: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Scanning {} using {}", file_path, index_dir);
     let start = Instant::now();
-    let n_found = file_scanner::scan_raw(&Path::new(&file_path), &Path::new(&index_dir))?;
+    let n_found = file_scanner::scan_raw(&Path::new(&file_path), &Path::new(&state_file), &Path::new(&index_dir))?;
     eprintln!("Found {} key/s in {:?}", n_found, start.elapsed());
     Ok(())
 }
@@ -138,8 +142,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             index_build(block_dir.as_str(), index_dir.as_str(), factor)?,
         Commands::IndexQuery { address, index_dir } =>
             index_query(address.as_str(), index_dir.as_str())?,
-        Commands::ScanRaw { file, index_dir } =>
-            scan_raw(file.as_str(), index_dir.as_str())?,
+        Commands::ScanRaw { file, checkpoint_file, index_dir } =>
+            scan_raw(file.as_str(), checkpoint_file.as_str(), index_dir.as_str())?,
     }
 
     Ok(())
