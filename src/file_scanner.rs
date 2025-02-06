@@ -1,6 +1,7 @@
 use crate::address_index::AddressIndex;
 use crate::crypto::{pkh_to_bitcoin_address, sk_to_pk_hash, PKH, SK, SK_LENGTH};
 use crossbeam::channel;
+use crossbeam::channel::TryRecvError;
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
@@ -149,7 +150,9 @@ pub fn scan_raw(
     let (work_tx, work_rx) = channel::bounded::<WorkMessage>(1024);
     let (key_tx, key_rx) = channel::bounded::<KeyMessage>(1024);
     let (progress_tx, progress_rx) = channel::bounded::<()>(1);
+    let (progress_trigger_tx, progress_trigger_rx) = channel::bounded::<()>(1);
     let (checkpoint_tx, checkpoint_rx) = channel::bounded::<()>(1);
+    let (checkpoint_trigger_tx, checkpoint_trigger_rx) = channel::bounded::<()>(1);
 
     // Thread to update progress bar counts
     let progress_thread = {
@@ -179,10 +182,13 @@ pub fn scan_raw(
     let progress_trigger_thread = {
         let progress_tx = progress_tx.clone();
         thread::spawn(move || loop {
-            if progress_tx.send(()).is_err() {
-                break;
+            match progress_trigger_rx.try_recv() {
+                Err(TryRecvError::Disconnected) => break,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    progress_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
-            thread::sleep(Duration::from_millis(10));
         })
     };
 
@@ -248,8 +254,6 @@ pub fn scan_raw(
 
                 stats.offset.store(offset, Ordering::Relaxed);
             }
-
-            drop(work_tx);
         })
     };
 
@@ -257,7 +261,7 @@ pub fn scan_raw(
     let key_processing_thread = {
         let stats = Arc::clone(&stats);
         let checkpoint = Arc::clone(&checkpoint);
-        
+
         let mut recovered: HashSet<SK> = HashSet::new();
         for recovered_key in checkpoint.lock().unwrap().results.clone() {
             recovered.insert(recovered_key.sk);
@@ -322,10 +326,13 @@ pub fn scan_raw(
     let checkpoint_trigger_thread = {
         let checkpoint_tx = checkpoint_tx.clone();
         thread::spawn(move || loop {
-            if checkpoint_tx.send(()).is_err() {
-                break;
+            match checkpoint_trigger_rx.try_recv() {
+                Err(TryRecvError::Disconnected) => break,
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    checkpoint_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(1000));
+                }
             }
-            thread::sleep(Duration::from_millis(1000));
         })
     };
 
@@ -338,14 +345,16 @@ pub fn scan_raw(
 
     // Flush progress updates, stop the progress thread
     progress_tx.send(()).unwrap();
-    drop(progress_tx);
+    drop(progress_trigger_tx);
     progress_trigger_thread.join().unwrap();
+    drop(progress_tx);
     progress_thread.join().unwrap();
 
     // Flush checkpoint updates, stop the checkpoint thread
     checkpoint_tx.send(()).unwrap();
-    drop(checkpoint_tx);
+    drop(checkpoint_trigger_tx);
     checkpoint_trigger_thread.join().unwrap();
+    drop(checkpoint_tx);
     checkpoint_thread.join().unwrap();
 
     // Wait for all workers to finish
