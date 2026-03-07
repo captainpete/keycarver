@@ -54,6 +54,17 @@ pub fn pkh_to_bitcoin_address(pkh: &[u8; 20]) -> String {
     bs58::encode(bytes).into_string()
 }
 
+pub fn pkh_to_p2wpkh_address(pkh: &[u8; 20]) -> String {
+    use bitcoin::{WPubkeyHash, Address, Network, ScriptBuf};
+    use bitcoin::hashes::{Hash, hash160};
+    let h160 = hash160::Hash::from_byte_array(*pkh);
+    let wpkh = WPubkeyHash::from_raw_hash(h160);
+    let script = ScriptBuf::new_p2wpkh(&wpkh);
+    Address::from_script(&script, Network::Bitcoin)
+        .expect("valid p2wpkh script")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +105,14 @@ mod tests {
         assert_eq!(
             pkh_to_bitcoin_address(&hex!("9652d86bedf43ad264362e6e6eba6eb764508127")),
             "1EhqbyUMvvs7BfL8goY6qcPbD6YKfPqb7e"
+        )
+    }
+
+    #[test]
+    fn test_pkh_to_p2wpkh_address() {
+        assert_eq!(
+            pkh_to_p2wpkh_address(&hex!("9652d86bedf43ad264362e6e6eba6eb764508127")),
+            "bc1qjefds6ld7sadyepk9ehxawnwkaj9pqf8xuq2eg"
         )
     }
 

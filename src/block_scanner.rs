@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::fs::{read_dir, File};
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::crypto::PKH;
 
@@ -127,6 +129,7 @@ pub fn load_unique_addresses_into_database(
     pb.set_length(paths.len() as u64);
 
     // Process files in parallel
+    let error_count = Arc::new(AtomicUsize::new(0));
     paths.par_iter().progress_with(pb.clone()).for_each(|path| {
         match extract_addresses_from_block_file(path.to_string()) {
             Ok(addresses) => {
@@ -138,10 +141,20 @@ pub fn load_unique_addresses_into_database(
                 db.write(batch).unwrap();
             }
             Err(err) => {
-                eprintln!("Error processing file: {}", err);
+                eprintln!("Error processing {}: {}", path, err);
+                error_count.fetch_add(1, Ordering::Relaxed);
             }
         }
     });
+
+    let n_errors = error_count.load(Ordering::Relaxed);
+    if n_errors > 0 {
+        return Err(format!(
+            "{} block file(s) failed to process — index may be incomplete. \
+             Re-run index-build after investigating the errors above.",
+            n_errors
+        ).into());
+    }
 
     Ok(())
 }

@@ -214,14 +214,16 @@ pub fn create_mphf(staging_dir: &Path, gamma: f64) -> Result<Mphf<PKH>, Box<dyn 
 
 /// Serializes the MPHF to a file.
 pub fn save_mphf(index_dir: &Path, mphf: &Mphf<PKH>) -> Result<(), Box<dyn Error>> {
-    let mut file = File::create(index_dir.join("mphf.bin"))?;
-    bincode::serialize_into(&mut file, mphf)?;
+    let file = File::create(index_dir.join("mphf.bin"))?;
+    let mut writer = std::io::BufWriter::new(file);
+    bincode::serialize_into(&mut writer, mphf)?;
     Ok(())
 }
 
 fn load_mphf(index_dir: &Path) -> Result<Mphf<PKH>, Box<dyn Error>> {
     let file = File::open(index_dir.join("mphf.bin"))?;
-    let mphf = bincode::deserialize_from(file)?;
+    let reader = std::io::BufReader::new(file);
+    let mphf = bincode::deserialize_from(reader)?;
     Ok(mphf)
 }
 
@@ -250,12 +252,15 @@ pub fn create_index(
     // Create a channel for worker threads to send (offset, address) tuples
     let (tx, rx) = channel::bounded::<(usize, PKH)>(1024);
 
+    // Wrap in Arc so threads share a single copy rather than each cloning the full structure
+    let mphf = Arc::new(mphf.clone());
+
     // Spawn worker threads to process staging files
     let worker_handles: Vec<_> = files
         .into_iter()
         .map(|file_path| {
             let tx = tx.clone();
-            let mphf = mphf.clone(); // Clone Arc-wrapped MPHF for thread-safe sharing
+            let mphf = Arc::clone(&mphf);
             thread::spawn(move || {
                 let file = File::open(file_path).unwrap();
                 let mut address_iterator = StagingAddressIterator::new(file).unwrap();

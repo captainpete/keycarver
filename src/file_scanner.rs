@@ -1,10 +1,10 @@
 use crate::address_index::AddressIndex;
-use crate::crypto::{pkh_to_bitcoin_address, sk_to_pk_hash, PKH, SK, SK_LENGTH};
+use crate::crypto::{pkh_to_bitcoin_address, pkh_to_p2wpkh_address, sk_to_pk_hash, PKH, SK, SK_LENGTH};
 use crossbeam::channel;
 use crossbeam::channel::TryRecvError;
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use quick_cache::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -76,25 +76,34 @@ fn check_bytes(sk: SK, index: &AddressIndex, stats: &Stats) -> Option<(SK, PKH)>
 
 /// Prints the recovered key to stdout
 fn print_result(recovered_key: RecoveredKey) {
+    let p2wpkh = pkh_to_p2wpkh_address(&recovered_key.pkh);
     println!(
-        "priv: {}, pkh: {}, addr: {}, offset: {}",
+        "priv: {}, pkh: {}, p2pkh: {}, p2wpkh: {}, offset: {}",
         hex::encode(&recovered_key.sk),
         hex::encode(&recovered_key.pkh),
         &recovered_key.addr,
+        p2wpkh,
         recovered_key.offset,
     );
 }
+
+// Positions the reader may have queued into the work channel but workers hadn't yet
+// processed when the last checkpoint was written. We back up by this much on resume.
+const RESUME_SAFETY_MARGIN: usize = 4096;
 
 /// Scan a file for potential private keys and count matches against the index.
 pub fn scan_raw(
     file_path: &Path,
     checkpoint_file: &Path,
     index_dir: &Path,
+    cache_size: usize,
 ) -> Result<u64, Box<dyn Error>> {
     // Memory-map the file
     let file = File::open(file_path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let file_size = mmap.len();
+    // Hint to the kernel that we'll read sequentially so it prefetches aggressively
+    mmap.advise(Advice::Sequential).ok();
 
     // Load/create checkpoint
     let checkpoint = Arc::new(Mutex::new({
@@ -118,6 +127,8 @@ pub fn scan_raw(
         checkpoint
     }));
     let stats = Arc::new(checkpoint.lock().unwrap().stats.snapshot());
+    // Capture baseline for session-relative rate reporting; on first run this is 0
+    let session_start_candidates = stats.sk_candidate_count.load(Ordering::Relaxed);
 
     // Load index
     let index = Arc::new(AddressIndex::new(index_dir)?);
@@ -163,13 +174,15 @@ pub fn scan_raw(
             while progress_rx.recv().is_ok() {
                 pb.set_position(stats.offset.load(Ordering::Relaxed) as u64);
 
-                let key_count = stats.sk_candidate_count.load(Ordering::Relaxed);
+                let total_candidates = stats.sk_candidate_count.load(Ordering::Relaxed);
+                // Rate is relative to this session only so it's accurate on resume
+                let session_candidates = total_candidates.saturating_sub(session_start_candidates);
                 let elapsed = start_time.elapsed().as_secs_f64();
-                let mkps = key_count as f64 / elapsed / 1e6;
+                let mkps = session_candidates as f64 / elapsed / 1e6;
 
                 pb.set_message(format!(
                     "SK candidates: {} ({:.3} Mk/s), SKs validated: {} ({} unique), cache hits: {}, cache misses: {}",
-                    key_count,
+                    total_candidates,
                     mkps,
                     stats.sk_validated_count.load(Ordering::Relaxed),
                     stats.sk_validated_unique_count.load(Ordering::Relaxed),
@@ -219,13 +232,16 @@ pub fn scan_raw(
     // Reader thread to push keys into the work channel
     let reader_thread = {
         let work_tx = work_tx.clone();
-        let cache = Cache::<SK, ()>::new((1024 * 1024) as usize);
+        let cache = Cache::<SK, ()>::new(cache_size);
         let stats = Arc::clone(&stats);
 
         std::thread::spawn(move || {
             let mut buffer = [0u8; SK_LENGTH];
 
-            let starting_offset = stats.offset.load(Ordering::Relaxed);
+            // Back up from the checkpointed offset to cover any positions that were
+            // in-flight in the work channel or with workers when the checkpoint was written
+            let starting_offset = stats.offset.load(Ordering::Relaxed)
+                .saturating_sub(RESUME_SAFETY_MARGIN);
             for offset in starting_offset..file_size {
                 let remaining = file_size - offset;
                 if remaining < SK_LENGTH {
