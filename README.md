@@ -2,6 +2,8 @@
 
 Scans raw disk images for Bitcoin private keys by testing every 32-byte sequence against a pre-built index of known blockchain addresses.
 
+Full writeup: [dojo7.com/2025/01/08/keycarver](https://dojo7.com/2025/01/08/keycarver/)
+
 ### Building
 
 ```
@@ -79,14 +81,6 @@ Repeated byte sequences (common in sparse or zeroed regions of a drive) are filt
 - No support for HD wallet derivation (BIP-32). Experimental support is on a feature branch.
 - No GPU acceleration of the EC or hash operations.
 - No support from this maintainer.
-
-### The journey
-
-I had downtime and a stack of dusty USB drives taking up space in a junk drawer. I'd lost track of some old wallets and suspected one might contain a backup.
-
-I'd formatted the drives but hadn't zeroed the free space. So I imaged them with [ddrescue](https://www.gnu.org/software/ddrescue/) and got to work. Traditional file carving with [photorec](https://en.wikipedia.org/wiki/PhotoRec) produced a lot of false positives (BerkeleyDB, SQLite databases that weren't actually wallets). Brute-forcing the raw key bytes turned out to be more reliable: if the 32 bytes were on disk anywhere, this would find them.
-
-I set up a Bitcoin full node, scanned the blockchain to build the address database, and ran the scanner across all the images. Recovered several previously lost keys — none with meaningful balances, but at least now I know.
 
 ### Contributions
 
