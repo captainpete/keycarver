@@ -158,7 +158,7 @@ pub fn scan_raw(
     }
 
     // Channels
-    let (work_tx, work_rx) = channel::bounded::<WorkMessage>(1024);
+    let (work_tx, work_rx) = channel::bounded::<WorkMessage>(65536);
     let (key_tx, key_rx) = channel::bounded::<KeyMessage>(1024);
     let (progress_tx, progress_rx) = channel::bounded::<()>(1);
     let (progress_trigger_tx, progress_trigger_rx) = channel::bounded::<()>(1);
