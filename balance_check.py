@@ -6,6 +6,10 @@ Usage:
     uv run balance_check.py checkpoints/
     uv run balance_check.py checkpoints-v2/
     uv run balance_check.py checkpoints/ checkpoints-v2/ --coins btc,bch --output results.csv
+
+Re-runs are cheap: already-queried addresses are served from the cache file and
+not re-fetched. Delete the cache file (default: balance_cache.json) to force a
+full refresh.
 """
 
 import argparse
@@ -94,6 +98,19 @@ def check_balance(session: requests.Session, addr: str, coin: str, retries: int 
     return None
 
 
+def load_cache(cache_path: Path) -> dict:
+    """Load cached balance results keyed by address."""
+    if cache_path.exists():
+        with open(cache_path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_cache(cache: dict, cache_path: Path) -> None:
+    with open(cache_path, 'w') as f:
+        json.dump(cache, f)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check BTC/BCH balances for keys recovered from drive scans",
@@ -106,11 +123,14 @@ def main():
                         help='Comma-separated coins to check (default: btc,bch)')
     parser.add_argument('--output', '-o', default='balance_results.csv',
                         help='Output CSV path (default: balance_results.csv)')
+    parser.add_argument('--cache', default='balance_cache.json',
+                        help='Cache file for API responses (default: balance_cache.json)')
     parser.add_argument('--sleep', type=float, default=1.0,
                         help='Seconds between API requests (default: 1.0)')
     args = parser.parse_args()
 
     coins = [c.strip().lower() for c in args.coins.split(',')]
+    cache_path = Path(args.cache)
 
     print(f"Loading checkpoints from: {args.checkpoint_dirs}", file=sys.stderr)
     addr_map = load_checkpoints(args.checkpoint_dirs)
@@ -118,21 +138,41 @@ def main():
     print(f"Unique addresses to check: {total} ({total // 2} keys × 2 address formats)",
           file=sys.stderr)
 
+    cache = load_cache(cache_path)
+    cached_count = sum(1 for addr in addr_map if addr in cache)
+    if cached_count:
+        print(f"Cache hit: {cached_count}/{total} addresses already checked (delete {cache_path} to refresh)",
+              file=sys.stderr)
+
     results = []
     hits = []
 
     session = requests.Session()
     session.headers['User-Agent'] = 'keycarver-balance-check/1.0'
 
+    uncached = [e for e in addr_map.values() if e['addr'] not in cache]
+
     for entry in tqdm(addr_map.values(), desc='Checking balances', unit='addr'):
+        addr = entry['addr']
         row = dict(entry)
+
+        if addr in cache:
+            cached_balances = cache[addr]
+        else:
+            cached_balances = {}
+            for coin in coins:
+                balance = check_balance(session, addr, coin)
+                cached_balances[f'{coin}_balance'] = balance
+                time.sleep(args.sleep)
+            cache[addr] = cached_balances
+            save_cache(cache, cache_path)
+
         has_balance = False
         for coin in coins:
-            balance = check_balance(session, entry['addr'], coin)
+            balance = cached_balances.get(f'{coin}_balance')
             row[f'{coin}_balance'] = balance
             if balance and balance > 0:
                 has_balance = True
-            time.sleep(args.sleep)
 
         results.append(row)
         if has_balance:
