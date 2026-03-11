@@ -1,12 +1,12 @@
 use crate::address_index::AddressIndex;
 use crate::crypto::{pkh_to_bitcoin_address, pkh_to_p2wpkh_address, sk_to_pk_hash, PKH, SK, SK_LENGTH};
+use crate::scanner_common::{Checkpoint, RecoveredKey, Stats};
 use crossbeam::channel;
 use crossbeam::channel::TryRecvError;
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::{Advice, Mmap};
 use quick_cache::sync::Cache;
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::File;
@@ -14,53 +14,11 @@ use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::process::exit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
-
-/// Statistics for tracking processing progress
-#[derive(Default, Serialize, Deserialize)]
-struct Stats {
-    sk_candidate_count: AtomicUsize,
-    sk_validated_count: AtomicUsize,
-    sk_validated_unique_count: AtomicUsize,
-    cache_hits: AtomicUsize,
-    cache_misses: AtomicUsize,
-    offset: AtomicUsize,
-}
-
-impl Stats {
-    fn snapshot(&self) -> Stats {
-        Stats {
-            sk_candidate_count: self.sk_candidate_count.load(Ordering::Relaxed).into(),
-            sk_validated_count: self.sk_validated_count.load(Ordering::Relaxed).into(),
-            sk_validated_unique_count: self
-                .sk_validated_unique_count
-                .load(Ordering::Relaxed)
-                .into(),
-            cache_hits: self.cache_hits.load(Ordering::Relaxed).into(),
-            cache_misses: self.cache_misses.load(Ordering::Relaxed).into(),
-            offset: self.offset.load(Ordering::Relaxed).into(),
-        }
-    }
-}
-
-/// Structs for keeping progress and making things idempotent
-#[derive(Serialize, Deserialize, Clone)]
-struct RecoveredKey {
-    sk: SK,
-    pkh: PKH,
-    addr: String,
-    offset: usize,
-}
-#[derive(Default, Serialize, Deserialize)]
-struct Checkpoint {
-    stats: Stats,
-    results: Vec<RecoveredKey>,
-    file_size: usize,
-}
 
 /// Check if the byte slice represents a private key corresponding to an address in the index.
 fn check_bytes(sk: SK, index: &AddressIndex, stats: &Stats) -> Option<(SK, PKH)> {

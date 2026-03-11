@@ -1,12 +1,16 @@
 mod address_index;
 mod block_scanner;
-mod file_scanner;
 mod crypto;
+mod file_scanner;
+mod scanner_common;
+
+#[cfg(feature = "cuda")]
+mod gpu_scanner;
 
 use clap::{Parser, Subcommand};
-use std::time::Instant;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -54,10 +58,20 @@ enum Commands {
         /// Default is 16M entries (~1GB). Increase on machines with more available RAM.
         #[arg(long, default_value = "16777216")]
         cache_size: usize,
+        /// Use GPU acceleration (requires cuda feature)
+        #[arg(long, default_value = "false")]
+        gpu: bool,
+        /// Chunk size for GPU scanning (bytes per batch)
+        #[arg(long, default_value = "1048576")]
+        gpu_chunk_size: usize,
     },
 }
 
-fn index_build(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<dyn std::error::Error>> {
+fn index_build(
+    block_dir: &str,
+    index_dir: &str,
+    gamma: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let index_dir = Path::new(index_dir);
     let multi_progress = MultiProgress::new();
     let bar_style = ProgressStyle::default_bar()
@@ -89,7 +103,8 @@ fn index_build(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
     step2_pb.finish_with_message(format!("Step 2: Done in {:.2?}", start.elapsed()));
 
     // Step 3: Create MPHF
-    let step3_pb = multi_progress.add(ProgressBar::new_spinner().with_style(spinner_style.clone()));
+    let step3_pb = multi_progress
+        .add(ProgressBar::new_spinner().with_style(spinner_style.clone()));
     step3_pb.enable_steady_tick(std::time::Duration::from_millis(100));
     step3_pb.set_message("Step 3: Creating MPHF");
     let start = Instant::now();
@@ -111,12 +126,14 @@ fn index_build(block_dir: &str, index_dir: &str, gamma: f64) -> Result<(), Box<d
     Ok(())
 }
 
-fn index_query(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // For testing:
-    //      14YhipytTEvpBaSX5hRnC1QoRUCpn5b9M2 randomly generated, should not be found
-    //      1A1Q3o2N9kAJsbXhtyDU6AZxV5XkZP8iR7 should be present in blk02507.dat
-
-    eprintln!("Querying index {} for address {}", index_dir, formatted_address);
+fn index_query(
+    formatted_address: &str,
+    index_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "Querying index {} for address {}",
+        index_dir, formatted_address
+    );
     let index = address_index::AddressIndex::new(&Path::new(&index_dir))?;
     let start = Instant::now();
     let result = index.contains_address_str(formatted_address);
@@ -130,10 +147,44 @@ fn index_query(formatted_address: &str, index_dir: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn scan_raw(file_path: &str, state_file: &str, index_dir: &str, cache_size: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn scan_raw(
+    file_path: &str,
+    state_file: &str,
+    index_dir: &str,
+    cache_size: usize,
+    gpu: bool,
+    gpu_chunk_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if gpu {
+        #[cfg(feature = "cuda")]
+        {
+            eprintln!("GPU scanning {} using {}", file_path, index_dir);
+            let start = Instant::now();
+            let n_found = gpu_scanner::scan_raw_gpu(
+                &Path::new(&file_path),
+                &Path::new(&state_file),
+                &Path::new(&index_dir),
+                gpu_chunk_size,
+            )?;
+            eprintln!("Found {} key/s in {:?}", n_found, start.elapsed());
+            return Ok(());
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (gpu_chunk_size,);
+            eprintln!("Error: binary not compiled with --features cuda");
+            std::process::exit(1);
+        }
+    }
+
     eprintln!("Scanning {} using {}", file_path, index_dir);
     let start = Instant::now();
-    let n_found = file_scanner::scan_raw(&Path::new(&file_path), &Path::new(&state_file), &Path::new(&index_dir), cache_size)?;
+    let n_found = file_scanner::scan_raw(
+        &Path::new(&file_path),
+        &Path::new(&state_file),
+        &Path::new(&index_dir),
+        cache_size,
+    )?;
     eprintln!("Found {} key/s in {:?}", n_found, start.elapsed());
     Ok(())
 }
@@ -142,12 +193,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::IndexBuild { block_dir, index_dir, factor } =>
-            index_build(block_dir.as_str(), index_dir.as_str(), factor)?,
-        Commands::IndexQuery { address, index_dir } =>
-            index_query(address.as_str(), index_dir.as_str())?,
-        Commands::ScanRaw { file, checkpoint_file, index_dir, cache_size } =>
-            scan_raw(file.as_str(), checkpoint_file.as_str(), index_dir.as_str(), cache_size)?,
+        Commands::IndexBuild {
+            block_dir,
+            index_dir,
+            factor,
+        } => index_build(block_dir.as_str(), index_dir.as_str(), factor)?,
+        Commands::IndexQuery { address, index_dir } => {
+            index_query(address.as_str(), index_dir.as_str())?
+        }
+        Commands::ScanRaw {
+            file,
+            checkpoint_file,
+            index_dir,
+            cache_size,
+            gpu,
+            gpu_chunk_size,
+        } => scan_raw(
+            file.as_str(),
+            checkpoint_file.as_str(),
+            index_dir.as_str(),
+            cache_size,
+            gpu,
+            gpu_chunk_size,
+        )?,
     }
 
     Ok(())
