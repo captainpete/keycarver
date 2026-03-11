@@ -10,6 +10,12 @@ Full writeup: [dojo7.com/2025/01/08/keycarver](https://dojo7.com/2025/01/08/keyc
 cargo build --release
 ```
 
+For GPU acceleration (requires CUDA toolkit and an NVIDIA GPU):
+
+```
+cargo build --release --features cuda
+```
+
 ### Workflow
 
 There are three steps: build an address index from your Bitcoin node's block files, then scan drive images against it.
@@ -30,6 +36,7 @@ keycarver index-query --address <address> --index-dir <path/to/index>
 
 **3. Scan a drive image**
 
+CPU:
 ```
 keycarver scan-raw \
   --file <image.bin> \
@@ -38,7 +45,21 @@ keycarver scan-raw \
   --cache-size 16777216
 ```
 
-Tests every byte offset in the file as a candidate 32-byte private key. Checks each valid key against the index. Saves progress to `--checkpoint-file` every second so interrupted scans can be resumed. `--cache-size` controls the deduplication cache (entries of 32 bytes each, ~64 bytes overhead per entry); the default 16M entries uses ~1GB of RAM — increase this on machines with more available memory.
+GPU (requires `--features cuda` build):
+```
+keycarver scan-raw \
+  --file <image.bin> \
+  --checkpoint-file <image.bin.chk> \
+  --index-dir <path/to/index> \
+  --gpu \
+  --gpu-chunk-size 4194304
+```
+
+Tests every byte offset in the file as a candidate 32-byte private key. Checks each valid key against the index. Saves progress to `--checkpoint-file` every second so interrupted scans can be resumed.
+
+CPU options: `--cache-size` controls the deduplication cache (entries of 32 bytes each, ~64 bytes overhead per entry); the default 16M entries uses ~1GB of RAM.
+
+GPU options: `--gpu-chunk-size` sets the batch size in bytes (default 1MB; 4–16MB recommended). Checkpoint files are compatible between CPU and GPU runs — you can switch modes and resume.
 
 Output lines look like:
 ```
@@ -67,11 +88,19 @@ The scanner reads the image with a 32-byte sliding window, one byte at a time. E
 
 The index is built using [boomphf](https://github.com/10XGenomics/rust-boomphf) — a minimal perfect hash function over all known PKHs. At query time, the MPHF maps a PKH to an offset in a memory-mapped flat file storing the actual PKH bytes at that position. A match requires the stored value to equal the query, ruling out false positives from hash collisions.
 
-Repeated byte sequences (common in sparse or zeroed regions of a drive) are filtered by a deduplication cache before the expensive EC multiplication step.
+The CPU path filters repeated byte sequences with a deduplication cache before the EC multiplication step.
+
+The GPU path runs the full SK→PKH pipeline (secp256k1 scalar multiply → SHA256 → RIPEMD160) in CUDA, one thread per byte offset. A precomputed table of 256 points (G, 2G, 4G, …, 2²⁵⁵·G) is generated in Rust and uploaded to the GPU once at startup. A double-buffer pipeline overlaps GPU computation with CPU-side index lookups (parallelised with rayon) so neither side sits idle waiting for the other.
 
 ### Performance
 
-- ~300k keys/sec on a 5975WX using 32 worker threads
+|Mode|Rate|Notes|
+|---|---|---|
+|CPU|~330k keys/sec|5975WX, 64 threads|
+|GPU|~3 Mk/sec|RTX 3090, PCIe 4.0 ×16|
+
+GPU throughput is primarily limited by register pressure in the secp256k1 kernel (low SM occupancy). The kernel uses ~192 registers per thread, leaving only ~1–2 warps active per SM on the RTX 3090.
+
 - Index startup: ~1 second for a full-blockchain index (~17GB index, ~370MB MPHF)
 - Memory: MPHF loaded into RAM (~370MB), index file memory-mapped
 
@@ -79,7 +108,7 @@ Repeated byte sequences (common in sparse or zeroed regions of a drive) are filt
 
 - Only finds keys stored as a contiguous 32-byte big-endian sequence. Keys in wallet file formats (Bitcoin Core, Electrum, etc.) won't be found this way — use [btc-recover](https://btcrecover.readthedocs.io/en/latest/) instead.
 - No support for HD wallet derivation (BIP-32). Experimental support is on a feature branch.
-- No GPU acceleration of the EC or hash operations.
+- GPU build requires CUDA 12.x toolkit and a compute capability 8.6+ GPU. Update the `cuda-12090` feature in `Cargo.toml` and `-arch=sm_86` in `build.rs` to match a different CUDA version or GPU architecture.
 - No support from this maintainer.
 
 ### Contributions
