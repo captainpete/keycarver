@@ -106,9 +106,24 @@ The D→H transfer uses regular pinned host memory (`cuMemHostAlloc` with `flags
 - Index startup: ~1 second for a full-blockchain index (~17GB index, ~370MB MPHF)
 - Memory: MPHF loaded into RAM (~370MB), index file memory-mapped
 
+### Wallet compatibility
+
+The scanner tests every 32-byte window on disk as a potential private key. This means it works for any wallet that stores the raw 32-byte EC scalar contiguously on disk — which covers more wallets than you might expect:
+
+| Wallet | Versions | Works? | Notes |
+|---|---|---|---|
+| **Bitcoin Core** | All (pre-HD, ~2009–2013) | Yes, if unencrypted | Keys stored in DER envelope inside `wallet.dat`; raw 32 bytes are present at a fixed offset within it |
+| **Armory** | ~2012–2016 | Yes, if no passphrase | Fixed-width binary format; 32-byte key at fixed offset per address entry |
+| **MultiBit Classic** | ~2011–2016 | Yes, if no password | bitcoinj protobuf `.wallet` file; `secret_bytes` field is raw 32 bytes |
+| **Mycelium** (Android) | ~2013–2016 | Likely yes | On-device SQLite database stores keys unencrypted (PIN is UI-only, not encryption) |
+| **Electrum** | 1.x/2.x, ~2011–2015 | **No** | Deterministic wallet — individual keys are never written to disk, only a 16-byte seed stored as ASCII hex text |
+| **Blockchain.info** | ~2011–2016 | **No** | Entire backup file is AES-encrypted; keys are WIF base58 text even after decryption |
+
+For any wallet with **passphrase/password encryption enabled**, the scanner will not find keys — the bytes on disk are AES ciphertext, not the raw scalar. Use [btc-recover](https://btcrecover.readthedocs.io/en/latest/) for encrypted wallets or Electrum seeds.
+
 ### Limitations
 
-- Only finds keys stored as a contiguous 32-byte big-endian sequence. Keys in wallet file formats (Bitcoin Core, Electrum, etc.) won't be found this way — use [btc-recover](https://btcrecover.readthedocs.io/en/latest/) instead.
+- Only finds keys stored as a contiguous 32-byte big-endian sequence. Does not handle WIF-encoded keys (base58), encrypted wallets, or seed-derived keys (Electrum, BIP-32 HD wallets).
 - No support for HD wallet derivation (BIP-32). Experimental support is on a feature branch.
 - GPU build requires CUDA 12.x toolkit and a compute capability 8.6+ GPU. Update the `cuda-12090` feature in `Cargo.toml` and `-arch=sm_86` in `build.rs` to match a different CUDA version or GPU architecture.
 - No support from this maintainer.
