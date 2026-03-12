@@ -11,7 +11,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressStyle};
-use memmap2::{Advice, Mmap};
+use memmap2::{Advice, Mmap, UncheckedAdvice};
+use std::ffi::c_void;
 
 use crate::address_index::AddressIndex;
 use crate::crypto::{pkh_to_bitcoin_address, pkh_to_p2wpkh_address, SK};
@@ -91,6 +92,36 @@ mod gpu {
     // Make JacobianPoint usable as a CUDA device type
     unsafe impl DeviceRepr for FieldElement {}
     unsafe impl DeviceRepr for JacobianPoint {}
+
+    /// Regular pinned (page-locked) host memory with flags=0.
+    ///
+    /// `ctx.alloc_pinned()` uses `CU_MEMHOSTALLOC_WRITECOMBINED` which makes CPU reads
+    /// uncached and ~10× slower — terrible for the MPHF lookup after D→H. This wrapper
+    /// uses flags=0 (regular pinned), giving fast cached CPU reads AND async DMA from GPU.
+    struct PinnedReadBuf {
+        ptr: *mut u8,
+        len: usize,
+    }
+    unsafe impl Send for PinnedReadBuf {}
+
+    impl PinnedReadBuf {
+        fn new(len: usize) -> Result<Self, Box<dyn Error>> {
+            let ptr = unsafe { cudarc::driver::result::malloc_host(len, 0) }? as *mut u8;
+            Ok(PinnedReadBuf { ptr, len })
+        }
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+        fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    impl Drop for PinnedReadBuf {
+        fn drop(&mut self) {
+            unsafe { cudarc::driver::result::free_host(self.ptr as *mut c_void).ok() };
+        }
+    }
 
     pub struct GpuContext {
         #[allow(dead_code)]
@@ -173,10 +204,10 @@ mod gpu {
     /// Pre-allocated buffers for one pipeline slot (device + host).
     struct Slot {
         stream: Arc<CudaStream>,
-        d_chunk: CudaSlice<u8>, // capacity: chunk_size + 31
-        d_pkhs: CudaSlice<u8>,  // capacity: (chunk_size + 31) * 20
-        h_pkhs: Vec<u8>,        // capacity: (chunk_size + 31) * 20
-        capacity: usize,        // chunk_size + 31
+        d_chunk: CudaSlice<u8>,    // capacity: chunk_size + 31
+        d_pkhs: CudaSlice<u8>,     // capacity: (chunk_size + 31) * 20
+        h_pkhs: PinnedReadBuf,     // regular pinned host: (chunk_size + 31) * 20
+        capacity: usize,           // chunk_size + 31
     }
 
     impl Slot {
@@ -185,7 +216,10 @@ mod gpu {
             let d_chunk = stream.alloc_zeros::<u8>(capacity)?;
             let d_pkhs = stream.alloc_zeros::<u8>(capacity * 20)?;
             stream.synchronize()?;
-            let h_pkhs = vec![0u8; capacity * 20];
+            // Regular pinned memory (flags=0): CPU reads are L1/L2 cached (fast MPHF),
+            // and DMA is page-locked so D→H is truly async (double-buffer overlap works).
+            // ctx.alloc_pinned() uses CU_MEMHOSTALLOC_WRITECOMBINED — CPU reads uncached.
+            let h_pkhs = PinnedReadBuf::new(capacity * 20)?;
             Ok(Slot {
                 stream,
                 d_chunk,
@@ -196,7 +230,7 @@ mod gpu {
         }
 
         /// Enqueue H→D copy, kernel launch, and D→H copy on this slot's stream.
-        /// Returns immediately; call `sync()` to wait for completion.
+        /// Returns immediately (all ops async); call `sync()` to wait for completion.
         fn submit(
             &mut self,
             chunk: &[u8],
@@ -215,7 +249,7 @@ mod gpu {
                 shared_mem_bytes: 0,
             };
 
-            // H→D: async copy chunk bytes into pre-allocated device buffer
+            // H→D: copy chunk bytes into pre-allocated device buffer
             {
                 let mut dst = self.d_chunk.slice_mut(0..n);
                 self.stream.memcpy_htod(chunk, &mut dst)?;
@@ -236,11 +270,10 @@ mod gpu {
                 };
             }
 
-            // D→H: async copy PKH results into pre-allocated host Vec
-            {
-                let src = self.d_pkhs.slice(0..n * 20);
-                self.stream.memcpy_dtoh(&src, &mut self.h_pkhs[0..n * 20])?;
-            }
+            // D→H: async copy all PKH results to pinned host buffer.
+            // Copies full capacity*20 bytes; positions n..capacity are zeroed (alloc_zeros),
+            // harmless since MPHF only reads h_pkhs[0..n*20]. Lengths match (both capacity*20).
+            self.stream.memcpy_dtoh(&self.d_pkhs, self.h_pkhs.as_mut_slice())?;
 
             Ok(())
         }
@@ -374,9 +407,13 @@ mod gpu {
             if let Some(work) = pending[prev].take() {
                 slots[prev].sync()?;
 
-                let pkhs = &slots[prev].h_pkhs[..work.positions * 20];
+                // Access pinned host buffer after stream sync.
+                let pkhs = &slots[prev].h_pkhs.as_slice()[..work.positions * 20];
 
-                // Parallel MPHF lookup across all CPU cores (rayon)
+                // Parallel MPHF lookup across all CPU cores (rayon).
+                // The sk_candidate_count atomic is NOT incremented inside the closure:
+                // doing so with 64 concurrent threads on the same cache line causes severe
+                // contention (~200× slowdown). Count non-zero PKHs in a single batch add.
                 let hits: Vec<(usize, [u8; 20])> = pkhs
                     .par_chunks(20)
                     .enumerate()
@@ -384,7 +421,6 @@ mod gpu {
                         if raw.iter().all(|&b| b == 0) {
                             return None;
                         }
-                        stats.sk_candidate_count.fetch_add(1, Ordering::Relaxed);
                         let pkh: [u8; 20] = raw.try_into().unwrap();
                         if index.contains_address_hash(&pkh) {
                             Some((work.chunk_start + i, pkh))
@@ -393,6 +429,12 @@ mod gpu {
                         }
                     })
                     .collect();
+
+                // Count non-zero PKHs with one atomic add instead of N contended adds.
+                let n_candidates = pkhs.par_chunks(20)
+                    .filter(|c| c.iter().any(|&b| b != 0))
+                    .count() as u64;
+                stats.sk_candidate_count.fetch_add(n_candidates as usize, Ordering::Relaxed);
 
                 for (hit_offset, pkh) in hits {
                     stats.sk_validated_count.fetch_add(1, Ordering::Relaxed);
@@ -417,6 +459,10 @@ mod gpu {
                         recovered.insert(sk);
                     }
                 }
+
+                // Release drive image pages for this chunk: prevents the 160GB sequential
+                // read from evicting the 17GB index from page cache.
+                unsafe { mmap.unchecked_advise_range(UncheckedAdvice::DontNeed, work.chunk_start, work.positions).ok() };
 
                 // Update progress
                 let processed = work.chunk_start + work.positions;

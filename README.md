@@ -97,9 +97,11 @@ The GPU path runs the full SK→PKH pipeline (secp256k1 scalar multiply → SHA2
 |Mode|Rate|Notes|
 |---|---|---|
 |CPU|~330k keys/sec|5975WX, 64 threads|
-|GPU|~3 Mk/sec|RTX 3090, PCIe 4.0 ×16|
+|GPU|~166 Mk/sec|RTX 3090, PCIe 4.0 ×16|
 
-GPU throughput is primarily limited by register pressure in the secp256k1 kernel (low SM occupancy). The kernel uses ~192 registers per thread, leaving only ~1–2 warps active per SM on the RTX 3090.
+GPU throughput is limited by the CPU-side MPHF index lookup, not the CUDA kernel — the GPU finishes each batch well before the CPU consumes the results. The kernel itself has low SM occupancy (~192 registers/thread → 1–2 warps/SM on RTX 3090), but the bottleneck is the random-access memory latency of the MPHF lookup across 64 rayon threads.
+
+The D→H transfer uses regular pinned host memory (`cuMemHostAlloc` with `flags=0`). Using write-combining pinned memory (`CU_MEMHOSTALLOC_WRITECOMBINED`) makes D→H async but CPU reads uncached, reducing throughput ~300×.
 
 - Index startup: ~1 second for a full-blockchain index (~17GB index, ~370MB MPHF)
 - Memory: MPHF loaded into RAM (~370MB), index file memory-mapped
